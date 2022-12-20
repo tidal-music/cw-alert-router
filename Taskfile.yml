@@ -1,0 +1,17 @@
+version: '3'
+
+tasks:
+  build:
+    cmds:
+      - docker build -t cw-alert-router:build .
+  publish:
+    deps: [build]
+    cmds:
+      - docker run -v "$(PWD):/target" --rm cw-alert-router:build cp /app/function.zip /target
+  cov:
+    cmds:
+      - go test -v -cverprofile=coverage.out -covermode=atomic -coverpkg=./... ./...
+  clean:
+    cmds:
+      - docker rmi -f cw-alert-router:build
+
