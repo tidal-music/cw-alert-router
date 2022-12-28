@@ -1,0 +1,20 @@
+name: build
+on:
+    push:
+        branches: [ $default-branch ]
+    pull_request:
+        branches: [ $default-branch ]
+jobs:
+    build:
+        runs-on: ubuntu-latest
+
+        steps:
+          - name: checkout
+            uses: actions/checkout@v3
+          - name: Install task
+            run: sudo sh -c "$(curl --location https://taskfile.dev/install.sh)" -- -d -b /usr/local/bin
+          - name: build
+            run: task build
+          - name: tests
+            run: task test
+
