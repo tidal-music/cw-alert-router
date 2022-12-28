@@ -1,9 +1,16 @@
 version: '3'
 
 tasks:
+  base:
+    cmds:
+      - docker build --target base . -t cw-alert-router:base
+  test:
+    deps: [base]
+    cmds:
+      - docker run -it cw-alert-router:base go test -v ./...
   build:
     cmds:
-      - docker build -t cw-alert-router:build .
+      - docker build --target build -t cw-alert-router:build .
   publish:
     deps: [build]
     cmds:
