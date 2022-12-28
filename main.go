@@ -24,7 +24,6 @@ func main() {
 
 	if err != nil {
 		log.Fatalf("Error initializing lambda: %v", err)
-        breakme!
 	}
 
 	lambda.SetConfig(cfg)

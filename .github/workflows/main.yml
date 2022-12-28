@@ -16,4 +16,3 @@ jobs:
             run: task build
           - name: tests
             run: task test
-
