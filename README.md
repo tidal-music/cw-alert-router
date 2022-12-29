@@ -1,5 +1,7 @@
 # Cloudwatch Alert Router
 
+![build&test](https://github.com/tidal-open-source/cw-alert-router/actions/workflows/main.yml/badge.svg)
+
 Cloudwatch Alert Router is a simple lambda that will take cloudwatch alarms (via 
 event bridge) and deliver them to Slack and/or PagerDuty depending.
 
