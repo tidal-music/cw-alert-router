@@ -7,7 +7,7 @@ tasks:
   test:
     deps: [base]
     cmds:
-      - docker run -it cw-alert-router:base go test -v ./...
+      - docker run -t cw-alert-router:base go test -v ./...
   build:
     cmds:
       - docker build --target build -t cw-alert-router:build .

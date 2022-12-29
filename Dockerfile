@@ -3,10 +3,10 @@ FROM golang as base
 ENV WORKDIR /app
 WORKDIR ${WORKDIR}
 
-COPY ./go.* ${WORKDIR}
+COPY ./go.* ${WORKDIR}/
 RUN go mod download
 
-COPY ./ ${WORKDIR}
+COPY ./ ${WORKDIR}/
 
 FROM base as build
 
