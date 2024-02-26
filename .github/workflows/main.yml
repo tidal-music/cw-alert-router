@@ -35,6 +35,7 @@ jobs:
 
           - name: "Comment"
             uses: actions/github-script@v7
+            if: sucess() || failure()
             with:
               script: |
                 github.rest.issues.createComment({
