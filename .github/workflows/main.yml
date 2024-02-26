@@ -27,7 +27,19 @@ jobs:
               api-key: ${{secrets.FOSSAAPIKEY}}
 
           - name: "FOSSA Tests"
+            id: fossa-tests
             uses: fossas/fossa-action@main
             with:
               api-key: ${{secrets.FOSSAAPIKEY}}
               run-tests: true
+
+          - name: "Comment"
+            uses: actions/github-script@v7
+            with:
+              script: |
+                github.rest.issues.createComment({
+                  issue_number: context.issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: steps.fossa-tests.outputs.result
+                })
