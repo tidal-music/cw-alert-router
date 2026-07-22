@@ -15,157 +15,255 @@
 package slack_test
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"sync"
+	"strings"
 	"testing"
 
-	log "github.com/sirupsen/logrus"
-
-	"github.com/tidal-open-source/cw-alert-router/slack"
-	"github.com/tidal-open-source/cw-alert-router/test"
+	"github.com/tidal-music/cw-alert-router/v2/slack"
+	"github.com/tidal-music/cw-alert-router/v2/test"
 )
 
-var once sync.Once
-var serverAddr string
-var sc *slack.Client
-var server *httptest.Server
-
-func startServer() {
-	server = httptest.NewServer(nil)
-	serverAddr = server.Listener.Addr().String()
-	log.Printf("Started test server at %s", serverAddr)
-}
-
-func setup(t *testing.T) {
-	var err error
-	log.SetLevel(log.DebugLevel)
-	once.Do(startServer)
-	sc, err = slack.New("blah", slack.WithAlternativeURL("http://"+serverAddr+"/"), slack.OptionDebug(true))
+func newTestClient(t *testing.T, server *test.SlackServer) *slack.Client {
+	t.Helper()
+	sc, err := slack.New("blah", slack.WithAlternativeURL(server.APIURL()))
 	if err != nil {
 		t.Fatalf("failed initializing slack client: %v", err)
 	}
+	return sc
 }
 
-func TestCWAlarmHeader(t *testing.T) {
-	expectedJSON := `{"type":"section","text":{"type":"mrkdwn","text":"*:white_check_mark: testing Cloudwatch Alarm: test-service-alarm-abcd*"}}`
-	slackBlock := sc.CWAlarmHeaderBlock(&test.ExpectedAlarmDetails, ":white_check_mark: testing")
-	// TODO: more validation on the slack stuff we're building
-	t.Logf("slackBlock: %+v", slackBlock)
-	inf, err := json.Marshal(slackBlock)
+func postedBlocks(t *testing.T, body []byte) string {
+	t.Helper()
+	values, err := url.ParseQuery(string(body))
 	if err != nil {
-		t.Errorf("Couldn't marshal the header block")
+		t.Fatalf("couldn't parse posted body: %v (%s)", err, body)
 	}
-	if string(inf) != expectedJSON {
-		t.Errorf("JSON didn't match - we wanted: %s -- but we got: %s", expectedJSON, string(inf))
+	blocks := values.Get("blocks")
+	if blocks == "" {
+		t.Fatalf("blocks parameter wasn't found in the body: %s", values)
+	}
+	return blocks
+}
+
+func TestHeaderBlock(t *testing.T) {
+	server := test.NewSlackServer()
+	defer server.Close()
+	sc := newTestClient(t, server)
+
+	expectedJSON := `{"type":"section","text":{"type":"mrkdwn","text":"*:white_check_mark: testing CloudWatch Alarm: test-service-alarm-abcd*"}}`
+	block := sc.HeaderBlock(&test.ExpectedAlarmDetails, ":white_check_mark: testing")
+	got, err := json.Marshal(block)
+	if err != nil {
+		t.Fatalf("Couldn't marshal the header block: %v", err)
+	}
+	if string(got) != expectedJSON {
+		t.Errorf("JSON didn't match - we wanted: %s -- but we got: %s", expectedJSON, got)
 	}
 }
 
-func TestSendEventResolved(t *testing.T) {
-	http.DefaultServeMux = new(http.ServeMux)
-	http.HandleFunc("/chat.postMessage", test.SendSlackMessage)
-	setup(t)
-	// a Go channel - not a slack channel ;)
-	// - we want to inspect the actual request that gets delivered to Slack - to ensure it contains "blocks"
-	slackChan := test.GetSlackMessageChannel()
-	cid, ts, err := sc.SendEventResolved("test-channel", &test.ExpectedAlarmDetails, "https://test-link.com/test123")
+func TestSummaryBlock(t *testing.T) {
+	server := test.NewSlackServer()
+	defer server.Close()
+	sc := newTestClient(t, server)
 
+	block := sc.SummaryBlock(&test.TriggeredAlarmDetails)
+	got, err := json.Marshal(block)
+	if err != nil {
+		t.Fatalf("Couldn't marshal the summary block: %v", err)
+	}
+	for _, want := range []string{"CPUUtilization", "AWS/EC2", "AutoScalingGroupName:test-service", "Threshold Crossed"} {
+		if !strings.Contains(string(got), want) {
+			t.Errorf("summary block missing %q: %s", want, got)
+		}
+	}
+}
+
+func TestLinkBlock(t *testing.T) {
+	server := test.NewSlackServer()
+	defer server.Close()
+	sc := newTestClient(t, server)
+
+	expectedJSON := "{\"type\":\"section\",\"text\":{\"type\":\"mrkdwn\",\"text\":\"Link: \\u003chttps://console.aws.amazon.com/cloudwatch/home?region=us-east-1#alarmsV2:alarm/test-service-alarm-abcd|AWS Console\\u003e\"}}"
+	block := sc.LinkBlock(&test.TriggeredAlarmDetails)
+	got, err := json.Marshal(block)
+	if err != nil {
+		t.Fatalf("Couldn't marshal the link block: %v", err)
+	}
+	if string(got) != expectedJSON {
+		t.Errorf("JSON result didn't match expected.  We wanted: %s -- but we got: %s", expectedJSON, got)
+	}
+}
+
+func TestSendEventResolvedWithImageURL(t *testing.T) {
+	server := test.NewSlackServer()
+	defer server.Close()
+	sc := newTestClient(t, server)
+
+	_, _, err := sc.SendEventResolved(context.Background(), "test-channel",
+		&test.ExpectedAlarmDetails, slack.ImageRef{URL: "https://test-link.com/test123.png"})
 	if err != nil {
 		t.Fatalf("failed sending resolved event: %v", err)
 	}
 
-	body := <-slackChan
-
-	actualBody, err := url.ParseQuery(string(body))
-
-	if err != nil {
-		t.Logf("Body: %s", string(body))
-		t.Errorf("Couldn't parse body: %v", err)
+	messages := server.Messages()
+	if len(messages) != 1 {
+		t.Fatalf("expected 1 posted message, got %d", len(messages))
 	}
-
-	// don't worry about the structure... slack seems to change quite frequently and we use their functions to build it.
-	// we just want some certainty that we've sent a seemingly correct requests off to them ;)
-	if _, ok := actualBody["blocks"]; !ok {
-		t.Errorf("blocks parameter wasn't found in the body: %s", actualBody)
+	blocks := postedBlocks(t, messages[0])
+	if !strings.Contains(blocks, "https://test-link.com/test123.png") {
+		t.Errorf("posted blocks missing image url: %s", blocks)
 	}
-
-	t.Logf("SendEventResolved: cid: %s, ts: %s, err: %v", cid, ts, err)
+	if !strings.Contains(blocks, "resolved") {
+		t.Errorf("posted blocks missing resolved prefix: %s", blocks)
+	}
 }
 
-func TestSendEventTriggered(t *testing.T) {
-	http.DefaultServeMux = new(http.ServeMux)
-	http.HandleFunc("/chat.postMessage", test.SendSlackMessage)
-	setup(t)
-	// a Go channel - not a slack channel ;)
-	// - we want to inspect the actual request that gets delivered to Slack - to ensure it contains "blocks"
-	slackChan := test.GetSlackMessageChannel()
-	cid, ts, err := sc.SendEventResolved("test-channel", &test.TriggeredAlarmDetails, "https://test-image-link.com/test123.png")
+func TestSendEventTriggeredWithSlackFile(t *testing.T) {
+	server := test.NewSlackServer()
+	defer server.Close()
+	sc := newTestClient(t, server)
 
+	_, _, err := sc.SendEventTriggered(context.Background(), "test-channel",
+		&test.TriggeredAlarmDetails, slack.ImageRef{SlackFileID: "F0000001"})
 	if err != nil {
-		t.Fatalf("failed sending resolved event: %v", err)
+		t.Fatalf("failed sending triggered event: %v", err)
 	}
 
-	body := <-slackChan
+	messages := server.Messages()
+	if len(messages) != 1 {
+		t.Fatalf("expected 1 posted message, got %d", len(messages))
+	}
+	blocks := postedBlocks(t, messages[0])
+	if !strings.Contains(blocks, "slack_file") || !strings.Contains(blocks, "F0000001") {
+		t.Errorf("posted blocks missing slack_file reference: %s", blocks)
+	}
+	if !strings.Contains(blocks, "triggered") {
+		t.Errorf("posted blocks missing triggered prefix: %s", blocks)
+	}
+}
 
-	actualBody, err := url.ParseQuery(string(body))
+func TestSendEventWithoutImage(t *testing.T) {
+	server := test.NewSlackServer()
+	defer server.Close()
+	sc := newTestClient(t, server)
 
+	_, _, err := sc.SendEventTriggered(context.Background(), "test-channel",
+		&test.TriggeredAlarmDetails, slack.ImageRef{})
 	if err != nil {
-		t.Logf("Body: %s", string(body))
-		t.Errorf("Couldn't parse body: %v", err)
+		t.Fatalf("failed sending triggered event: %v", err)
 	}
 
-	// don't worry about the structure... slack seems to change quite frequently and we use their functions to build it.
-	// we just want some certainty that we've sent a seemingly correct requests off to them ;)
-	if _, ok := actualBody["blocks"]; !ok {
-		t.Errorf("blocks parameter wasn't found in the body: %s", actualBody)
+	blocks := postedBlocks(t, server.Messages()[0])
+	if strings.Contains(blocks, "\"image\"") {
+		t.Errorf("posted blocks should not contain an image block: %s", blocks)
+	}
+}
+
+func TestUploadImage(t *testing.T) {
+	server := test.NewSlackServer()
+	defer server.Close()
+	sc := newTestClient(t, server)
+
+	fileID, err := sc.UploadImage(context.Background(), "graph.png", test.TestPNG)
+	if err != nil {
+		t.Fatalf("failed uploading image: %v", err)
+	}
+	if fileID == "" {
+		t.Fatalf("expected a file ID")
 	}
 
-	t.Logf("blocks content: %s", actualBody["blocks"])
+	uploaded, ok := server.Uploads()[fileID]
+	if !ok {
+		t.Fatalf("no upload recorded for file %s (uploads: %v)", fileID, server.Uploads())
+	}
+	if !bytes.Equal(uploaded, test.TestPNG) {
+		t.Errorf("uploaded content didn't match the source PNG")
+	}
+}
 
-	t.Logf("SendEventResolved: cid: %s, ts: %s, err: %v", cid, ts, err)
+func TestSendEventRetriesUnreadySlackFile(t *testing.T) {
+	// the first two postMessage calls claim the file block is invalid (the
+	// upload isn't ready yet), the third succeeds
+	var calls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/chat.postMessage", func(rw http.ResponseWriter, r *http.Request) {
+		calls++
+		rw.Header().Set("Content-Type", "application/json")
+		if calls < 3 {
+			rw.Write([]byte(`{"ok":false,"error":"invalid_blocks"}`))
+			return
+		}
+		rw.Write([]byte(`{"ok":true,"channel":"C123","ts":"1.2"}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	sc, err := slack.New("blah", slack.WithAlternativeURL(server.URL+"/"))
+	if err != nil {
+		t.Fatalf("failed initializing slack client: %v", err)
+	}
+
+	_, _, err = sc.SendEventTriggered(context.Background(), "test-channel",
+		&test.TriggeredAlarmDetails, slack.ImageRef{SlackFileID: "F0000001"})
+	if err != nil {
+		t.Fatalf("expected retry to succeed, got error: %v", err)
+	}
+	if calls != 3 {
+		t.Errorf("expected 3 postMessage attempts, got %d", calls)
+	}
+}
+
+func TestSendEventFallsBackWithoutImage(t *testing.T) {
+	// postMessage keeps rejecting the file block; the final attempt must
+	// drop the image and still deliver the alert
+	var bodies []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/chat.postMessage", func(rw http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(body))
+		rw.Header().Set("Content-Type", "application/json")
+		if strings.Contains(string(body), "slack_file") {
+			rw.Write([]byte(`{"ok":false,"error":"invalid_blocks"}`))
+			return
+		}
+		rw.Write([]byte(`{"ok":true,"channel":"C123","ts":"1.2"}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	sc, err := slack.New("blah", slack.WithAlternativeURL(server.URL+"/"))
+	if err != nil {
+		t.Fatalf("failed initializing slack client: %v", err)
+	}
+
+	_, _, err = sc.SendEventTriggered(context.Background(), "test-channel",
+		&test.TriggeredAlarmDetails, slack.ImageRef{SlackFileID: "F0000001"})
+	if err != nil {
+		t.Fatalf("expected fallback without image to succeed, got error: %v", err)
+	}
+	last := bodies[len(bodies)-1]
+	if strings.Contains(last, "slack_file") {
+		t.Errorf("final message should have dropped the image block: %s", last)
+	}
+	if !strings.Contains(last, "triggered") {
+		t.Errorf("final message should still be the alert: %s", last)
+	}
 }
 
 func TestSendSimpleTextMessage(t *testing.T) {
-	http.DefaultServeMux = new(http.ServeMux)
-	http.HandleFunc("/chat.postMessage", test.SendSlackMessage)
-	setup(t)
-	cid, ts, err := sc.SendSimpleTextMessage("test-channel", "Hello There!")
+	server := test.NewSlackServer()
+	defer server.Close()
+	sc := newTestClient(t, server)
+
+	cid, ts, err := sc.SendSimpleTextMessage(context.Background(), "test-channel", "Hello There!")
 	if err != nil {
 		t.Errorf("Error sending message: %v", err)
 	}
 	t.Logf("Sent message to channel %s (ts: %s)", cid, ts)
-}
-
-func TestCWAlarmSummary(t *testing.T) {
-	expectedJSON := "{\"type\":\"section\",\"text\":{\"type\":\"mrkdwn\",\"text\":\"*Metrics*: `Names: CPUUtilization - Namespaces: AWS/EC2 - Dimensions: AutoScalingGroupName:test-service`\\nRecent data: `error fetching metrics: cloudwatch client is nil`\"}}"
-	setup(t)
-	summary := sc.CWAlarmSummary(&test.TriggeredAlarmDetails)
-	if summary == nil {
-		t.Errorf("slack summary for cw alarm was nil")
-	}
-	inf, err := json.Marshal(summary)
-	if err != nil {
-		t.Errorf("Couldn't marshal the summary blocks: %v", err)
-	}
-	if string(inf) != expectedJSON {
-		t.Errorf("JSON result didn't match expected.  We wanted: %s -- but we got: %s", expectedJSON, string(inf))
-	}
-}
-
-func TestCWAlarmLink(t *testing.T) {
-	expectedJSON := "{\"type\":\"section\",\"text\":{\"type\":\"mrkdwn\",\"text\":\"Link: \\u003chttps://console.aws.amazon.com/cloudwatch/home?region=us-east-1#alarmsV2:alarm/test-service-alarm-abcd|AWS Console\\u003e\"}}"
-	setup(t)
-	linkBlock := sc.CWAlarmLink(&test.TriggeredAlarmDetails)
-	if linkBlock == nil {
-		t.Errorf("Slack alarm link was nil")
-	}
-	inf, err := json.Marshal(linkBlock)
-	if err != nil {
-		t.Errorf("Couldn't marshal the link block: %v", err)
-	}
-	if string(inf) != expectedJSON {
-		t.Errorf("JSON result didn't match expected.  We wanted: %s -- but we got: %s", expectedJSON, string(inf))
-	}
 }

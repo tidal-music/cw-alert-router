@@ -12,207 +12,110 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package main_test drives the full lambda handler end-to-end against mocked
+// AWS/Slack/PagerDuty backends, including the env-var configuration path.
 package main_test
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
-	"os"
-	"sync"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-lambda-go/lambdacontext"
 
-	"github.com/tidal-open-source/cw-alert-router/cw"
-	"github.com/tidal-open-source/cw-alert-router/lambda"
-	"github.com/tidal-open-source/cw-alert-router/pagerduty"
-	"github.com/tidal-open-source/cw-alert-router/parameterstore"
-	"github.com/tidal-open-source/cw-alert-router/s3"
-	"github.com/tidal-open-source/cw-alert-router/test"
+	"github.com/tidal-music/cw-alert-router/v2/cw"
+	"github.com/tidal-music/cw-alert-router/v2/lambda"
+	"github.com/tidal-music/cw-alert-router/v2/pagerduty"
+	"github.com/tidal-music/cw-alert-router/v2/parameterstore"
+	"github.com/tidal-music/cw-alert-router/v2/test"
 )
-
-var cwclient *cw.Client
-var cfg *lambda.Config
-var once sync.Once
-var slackServerAddr string
 
 const (
 	defaultSlackChannel        = "test-alarms"
-	defaultPagerDutyRoutingKey = "pagerduty-key-1"
-	defaultImageBucket         = "test-bucket-123"
-	defaultImageBucketRegion   = "eu-west-1"
-	defaultImageBucketRoleArn  = ""
-	defaultImageHost           = "https://test.image.host.com"
-	defaultLogLevel            = "DEBUG"
+	defaultPagerDutyRoutingKey = "default-pd-key"
 )
 
-func startSlackServer() {
-	slackServer := httptest.NewServer(nil)
-	slackServerAddr = slackServer.Listener.Addr().String()
+type fixture struct {
+	handler *lambda.Handler
+	slack   *test.SlackServer
+	pd      *test.MockPDClient
 }
 
-func setup(t *testing.T) {
-	os.Setenv(lambda.SlackTokenSSMKeyEnv, test.SlackTokenSSMKey)
-	os.Setenv(lambda.DefaultPagerDutyRoutingKeyEnv, defaultPagerDutyRoutingKey)
-	os.Setenv(lambda.DefaultSlackChannelEnv, defaultSlackChannel)
-	os.Setenv(lambda.ImageBucketEnv, defaultImageBucket)
-	os.Setenv(lambda.ImageBucketRoleArnEnv, defaultImageBucketRoleArn)
-	os.Setenv(lambda.LogLevelEnv, defaultLogLevel)
-	os.Setenv(lambda.ImageHostEnv, defaultImageHost)
-	os.Setenv(lambda.ImageBucketRegionEnv, defaultImageBucketRegion)
-	once.Do(startSlackServer)
+func setup(t *testing.T) *fixture {
+	t.Helper()
 
-	cwclient = &cw.Client{
-		CWClient: &test.MockCWClient{},
+	// configuration comes in via the environment, like in a real deployment
+	t.Setenv(lambda.DefaultSlackChannelEnv, defaultSlackChannel)
+	t.Setenv(lambda.DefaultPagerDutyRoutingKeyEnv, defaultPagerDutyRoutingKey)
+	t.Setenv(lambda.SlackTokenSSMKeyEnv, test.SlackTokenSSMKey)
+	t.Setenv(lambda.GraphModeEnv, lambda.GraphModeSlack)
+	t.Setenv(lambda.LogLevelEnv, "debug")
+
+	f := &fixture{
+		slack: test.NewSlackServer(),
+		pd:    &test.MockPDClient{},
 	}
+	t.Cleanup(f.slack.Close)
 
-	mc := &test.MockSSMClient{}
-	psclient, err := parameterstore.NewWithSSMClient(mc)
-
+	pdclient, err := pagerduty.New(pagerduty.WithAPI(f.pd))
 	if err != nil {
-		t.Fatalf("Failed creating new parameterstore client: %v", err)
+		t.Fatalf("failed creating pagerduty client: %v", err)
 	}
 
-	pdclient, err := pagerduty.New(pagerduty.WithPDAPIClient(&test.MockPDClient{}))
-
-	if err != nil {
-		t.Fatalf("failed creating new pagerduty client: %v", err)
-	}
-
-	s3client, err := s3.New(s3.WithS3APIClient(&test.MockS3Client{}))
-
-	if err != nil {
-		t.Fatalf("failed initializing mock s3 client: %v", err)
-	}
-
-	cfg, err = lambda.NewConfig(
-		lambda.WithParameterStoreClient(psclient),
+	// note: no WithSlackToken here - the token is fetched from the (mocked)
+	// parameter store, exercising the real startup path
+	f.handler, err = lambda.New(context.Background(), lambda.ConfigFromEnv(),
+		lambda.WithCWClient(cw.NewClientWithAPI(&test.MockCWAPI{})),
+		lambda.WithParameterStoreClient(parameterstore.NewWithAPI(&test.MockSSMClient{})),
 		lambda.WithPagerDutyClient(pdclient),
-		lambda.WithCWClient(cwclient),
-		lambda.WithSlackAlternativeURL("http://"+slackServerAddr+"/"),
-		lambda.WithS3Client(s3client),
+		lambda.WithSlackAPIURL(f.slack.APIURL()),
 	)
-
 	if err != nil {
-		t.Fatalf("Failed creating new lambda config: %v", err)
+		t.Fatalf("failed creating handler: %v", err)
 	}
+	return f
 }
 
 func TestLambdaHandler(t *testing.T) {
-	http.DefaultServeMux = new(http.ServeMux)
-	http.HandleFunc("/chat.postMessage", test.SendSlackMessage)
-	setup(t)
-	lambda.SetConfig(cfg)
-	ctx := context.Background()
+	f := setup(t)
 
-	lc := new(lambdacontext.LambdaContext)
-	ctx = lambdacontext.NewContext(ctx, lc)
-	body, err := lambda.HandleRequest(ctx, test.GenTestSQSEvent())
+	ctx := lambdacontext.NewContext(context.Background(), new(lambdacontext.LambdaContext))
+	resp, err := f.handler.HandleRequest(ctx, test.GenTestSQSEvent())
 	if err != nil {
-		t.Errorf("HandleRequest returned an error: %v", err)
+		t.Fatalf("HandleRequest returned an error: %v", err)
 	}
-	t.Logf("body: %s", body)
-}
-
-func TestGetFunctions(t *testing.T) {
-	expectedSlackChannel := "test-alarms"
-	expectedPagerDutyRoutingKey := "pagerduty-key-1"
-	expectedServiceName := "test-service"
-	http.DefaultServeMux = new(http.ServeMux)
-	http.HandleFunc("/chat.postMessage", test.SendSlackMessage)
-	setup(t)
-	lambda.SetConfig(cfg)
-
-	alarmDetail := test.TriggeredAlarmDetails
-	alarmDetail.SetCWClient(cfg.CWClient())
-	err := alarmDetail.InjectTags()
-
-	if err != nil {
-		t.Errorf("Failed injecting tags: %v", err)
+	if len(resp.BatchItemFailures) != 0 {
+		t.Fatalf("expected no batch item failures, got %+v", resp.BatchItemFailures)
 	}
 
-	if len(alarmDetail.Detail.Tags) <= 0 {
-		t.Fatalf("No tags were injected!")
+	// the test event is an ALARM -> OK transition: expect a resolved slack
+	// message (with an uploaded graph) and a pagerduty resolve
+	messages := f.slack.Messages()
+	if len(messages) != 1 {
+		t.Fatalf("expected 1 slack message, got %d", len(messages))
+	}
+	body := string(messages[0])
+	if !strings.Contains(body, "blocks") {
+		t.Errorf("slack message has no blocks: %s", body)
+	}
+	if !strings.Contains(body, "resolved") {
+		t.Errorf("slack message should be a resolved notification: %s", body)
+	}
+	if !strings.Contains(body, "slack_file") {
+		t.Errorf("slack message should embed the uploaded graph: %s", body)
+	}
+	if len(f.slack.Uploads()) != 1 {
+		t.Errorf("expected 1 uploaded graph, got %d", len(f.slack.Uploads()))
 	}
 
-	slackChan := lambda.GetSlackChannel(alarmDetail.Detail.Tags)
-	if slackChan != expectedSlackChannel {
-		t.Errorf("Didn't see the expected slack channel: %s (we got %s)", expectedSlackChannel, slackChan)
+	events := f.pd.Events()
+	if len(events) != 1 {
+		t.Fatalf("expected 1 pagerduty event, got %d", len(events))
 	}
-
-	ServiceName := lambda.GetServiceNameFromTags(alarmDetail.Detail.Tags)
-
-	if ServiceName != expectedServiceName {
-		t.Errorf("App name from tags (%s) didn't match expected (%s)", ServiceName, expectedServiceName)
+	if events[0].Action != pagerduty.ActionResolve {
+		t.Errorf("expected pagerduty resolve, got %s", events[0].Action)
 	}
-
-	pdkey := lambda.GetPagerDutyRoutingKey(ServiceName)
-	if pdkey != expectedPagerDutyRoutingKey {
-		t.Errorf("Didn't see the expected PagerDuty routing key: %s (we got: %s)", expectedPagerDutyRoutingKey, pdkey)
-	}
-}
-
-func TestGetOwner(t *testing.T) {
-	tests := []struct {
-		key           string
-		tags          cw.AlarmTags
-		expectedOwner string
-	}{
-		{
-			key: "",
-			tags: cw.AlarmTags{
-				lambda.DefaultOwnerTagKey: "somebody",
-			},
-			expectedOwner: "somebody",
-		},
-		{
-			key: "some_owner",
-			tags: cw.AlarmTags{
-				"some_owner": "other_person",
-			},
-			expectedOwner: "other_person",
-		},
-	}
-	for _, test := range tests {
-		t.Setenv(lambda.OwnerTagKeyEnv, test.key)
-		setup(t)
-		lambda.SetConfig(cfg)
-		owner := lambda.GetOwnerFromTags(test.tags)
-		if owner != test.expectedOwner {
-			t.Errorf("owner (%s) didn't match expected (%s)", owner, test.expectedOwner)
-		}
-	}
-}
-
-func TestGetServiceName(t *testing.T) {
-	tests := []struct {
-		key             string
-		tags            cw.AlarmTags
-		expectedService string
-	}{
-		{
-			key: "",
-			tags: cw.AlarmTags{
-				lambda.DefaultServiceNameTagKey: "service1",
-			},
-			expectedService: "service1",
-		},
-		{
-			key: "some_service",
-			tags: cw.AlarmTags{
-				"some_service": "service6",
-			},
-			expectedService: "service6",
-		},
-	}
-	for _, test := range tests {
-		t.Setenv(lambda.ServiceNameTagKeyEnv, test.key)
-		setup(t)
-		lambda.SetConfig(cfg)
-		owner := lambda.GetServiceNameFromTags(test.tags)
-		if owner != test.expectedService {
-			t.Errorf("service (%s) didn't match expected (%s)", owner, test.expectedService)
-		}
+	if events[0].RoutingKey != "pagerduty-key-1" {
+		t.Errorf("expected service routing key pagerduty-key-1, got %s", events[0].RoutingKey)
 	}
 }

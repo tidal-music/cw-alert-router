@@ -16,66 +16,50 @@ package s3_test
 
 import (
 	"bytes"
-	"reflect"
+	"context"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/tidal-open-source/cw-alert-router/s3"
-	"github.com/tidal-open-source/cw-alert-router/test"
+	"github.com/tidal-music/cw-alert-router/v2/s3"
+	"github.com/tidal-music/cw-alert-router/v2/test"
 )
 
-var (
-	s3client                   *s3.Client
-	s3PutObjectChannel         chan []byte
-	s3PutObjectCompleteChannel chan bool
-)
-
-func setup(t *testing.T) {
-	var err error
-	mc := &test.MockS3Client{}
-	s3PutObjectChannel = make(chan []byte, 1)
-	s3PutObjectCompleteChannel = make(chan bool, 1)
-	s3client, err = s3.New(s3.WithS3APIClient(mc))
+func TestWriteBytes(t *testing.T) {
+	mock := &test.MockS3API{}
+	client, err := s3.New(context.Background(), s3.WithAPI(mock))
 	if err != nil {
 		t.Fatalf("Failed initializing mock s3 client: %v", err)
 	}
-}
 
-func TestGetValidResponse(t *testing.T) {
-	setup(t)
 	testData := []byte("abc123")
 	key := "test/object1.png"
 	bucket := "test-bucket-1"
-	test.SetS3ReceiveChannel(s3PutObjectChannel, s3PutObjectCompleteChannel)
-	err := s3client.WriteBytes(bucket, key, bytes.NewReader(testData))
-	if err != nil {
-		t.Errorf("Error writing data to s3: %v", err)
+
+	if err := client.WriteBytes(context.Background(), bucket, key, bytes.NewReader(testData)); err != nil {
+		t.Fatalf("Error writing data to s3: %v", err)
 	}
 
-	var b []byte
-readloop:
-	for {
-		select {
-		case <-s3PutObjectCompleteChannel:
-			t.Logf("quit received")
-			break readloop
-		default:
-			b = <-s3PutObjectChannel
-			t.Logf("read: %v", b)
-		}
+	written, ok := mock.Object(bucket, key)
+	if !ok {
+		t.Fatalf("object %s/%s was not written (objects: %v)", bucket, key, mock.Objects())
 	}
-	if !reflect.DeepEqual(testData, b) {
-		t.Errorf("written data (%s) didn't match original (%s)", string(b), string(testData))
+	if !bytes.Equal(testData, written) {
+		t.Errorf("written data (%s) didn't match original (%s)", written, testData)
 	}
 }
 
-// No longer used.  instance role presigned links expire in 6 hours!
-//func TestGetObjectLink(t *testing.T) {
-//	setup(t)
-//	key := "test/object1.png"
-//	bucket := "test-bucket-1"
-//	link, err := s3client.GetObjectLink(bucket, key)
-//	if err != nil {
-//		t.Errorf("error getting object link: %v", err)
-//	}
-//	t.Logf("got link: %s", link)
-//}
+func TestPresignedURL(t *testing.T) {
+	client, err := s3.New(context.Background(), s3.WithAPI(&test.MockS3API{}), s3.WithPresigner(&test.MockS3Presigner{}))
+	if err != nil {
+		t.Fatalf("Failed initializing mock s3 client: %v", err)
+	}
+
+	url, err := client.PresignedURL(context.Background(), "test-bucket-1", "test/object1.png", time.Hour)
+	if err != nil {
+		t.Fatalf("Error presigning url: %v", err)
+	}
+	if !strings.Contains(url, "test-bucket-1") || !strings.Contains(url, "test/object1.png") {
+		t.Errorf("presigned url doesn't reference the object: %s", url)
+	}
+}

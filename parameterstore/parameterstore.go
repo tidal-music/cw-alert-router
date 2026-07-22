@@ -12,48 +12,54 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package parameterstore wraps AWS Systems Manager Parameter Store in a basic interface that provides calls specific to our needs
+// Package parameterstore wraps AWS Systems Manager Parameter Store in a basic
+// interface that provides calls specific to our needs.
 package parameterstore
 
 import (
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/ssm"
-	"github.com/aws/aws-sdk-go/service/ssm/ssmiface"
+	"context"
+	"errors"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
+	"github.com/aws/aws-sdk-go-v2/service/ssm/types"
 )
 
-// Client is our own parameter store client
+// API is the subset of the Systems Manager API this service uses.
+type API interface {
+	GetParameter(ctx context.Context, params *ssm.GetParameterInput, optFns ...func(*ssm.Options)) (*ssm.GetParameterOutput, error)
+}
+
+// Client is our own parameter store client.
 type Client struct {
-	psClient ssmiface.SSMAPI
+	api API
 }
 
-// New returns a new Client instance
-func New() (*Client, error) {
-	client := ssm.New(session.New())
-	return &Client{
-		psClient: client,
-	}, nil
+// New returns a Client backed by the real Systems Manager API.
+func New(cfg aws.Config) *Client {
+	return &Client{api: ssm.NewFromConfig(cfg)}
 }
 
-// NewWithSSMClient creates a new Client instance with a provided ssm client object
-func NewWithSSMClient(c ssmiface.SSMAPI) (*Client, error) {
-	return &Client{
-		psClient: c,
-	}, nil
+// NewWithAPI returns a Client backed by the given API implementation (for testing).
+func NewWithAPI(api API) *Client {
+	return &Client{api: api}
 }
 
-// GetParameterValue returns the string value of a given parameter store key (unencrypted if so)
-func (c *Client) GetParameterValue(key string) (string, error) {
-	req := &ssm.GetParameterInput{
+// GetParameterValue returns the string value of a given parameter store key
+// (decrypted if it is a SecureString).
+func (c *Client) GetParameterValue(ctx context.Context, key string) (string, error) {
+	resp, err := c.api.GetParameter(ctx, &ssm.GetParameterInput{
 		Name:           aws.String(key),
 		WithDecryption: aws.Bool(true),
-	}
-
-	resp, err := c.psClient.GetParameter(req)
-
+	})
 	if err != nil {
 		return "", err
 	}
+	return aws.ToString(resp.Parameter.Value), nil
+}
 
-	return *resp.Parameter.Value, nil
+// IsNotFound reports whether the error means the requested parameter does not exist.
+func IsNotFound(err error) bool {
+	var nf *types.ParameterNotFound
+	return errors.As(err, &nf)
 }

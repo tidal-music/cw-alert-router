@@ -12,178 +12,228 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package slack wraps the Slack API with calls specific to alarm notifications.
 package slack
 
 import (
-	"encoding/json"
+	"bytes"
+	"context"
 	"fmt"
+	"log/slog"
 	"strings"
-
-	log "github.com/sirupsen/logrus"
-
-	"github.com/tidal-open-source/cw-alert-router/cw"
+	"time"
 
 	slackapi "github.com/slack-go/slack"
+
+	"github.com/tidal-music/cw-alert-router/v2/cw"
 )
 
-// Client wraps slack with simpler more specific calls suited for this lambda
+// Emoji prefixes for the alarm state headers.
+const (
+	triggeredPrefix = ":rotating_light: (triggered)"
+	resolvedPrefix  = ":white_check_mark: (resolved)"
+)
+
+// Retry budget for referencing a just-uploaded file from an image block.
+const (
+	uploadedFileAttempts   = 3
+	uploadedFileRetryDelay = 500 * time.Millisecond
+)
+
+// ImageRef points at a graph image to embed in a message: either a public
+// URL, or the ID of a file already uploaded to Slack. The zero value means
+// "no image".
+type ImageRef struct {
+	URL         string
+	SlackFileID string
+}
+
+// Client wraps slack with simpler more specific calls suited for this lambda.
 type Client struct {
-	slackClient  *slackapi.Client
+	api          *slackapi.Client
 	alternateURL string
 	debug        bool
 }
 
-// ClientOptions provides the function opts pattern for overriding
+// ClientOptions provides the function opts pattern for overriding.
 type ClientOptions func(*Client)
 
-// WithAlternativeURL supplies an alternative URL to make slack api calls
+// WithAlternativeURL supplies an alternative URL to make slack api calls (for testing).
 func WithAlternativeURL(url string) ClientOptions {
 	return func(c *Client) {
 		c.alternateURL = url
 	}
 }
 
-// OptionDebug allows enabling/disabling debug
+// OptionDebug allows enabling/disabling debug.
 func OptionDebug(d bool) ClientOptions {
 	return func(c *Client) {
 		c.debug = d
 	}
 }
 
-// New returns a newly initialized slack client
+// New returns a newly initialized slack client.
 func New(slackAPIToken string, opts ...ClientOptions) (*Client, error) {
 	if slackAPIToken == "" {
 		return nil, fmt.Errorf("empty slack token provided")
 	}
 
 	c := &Client{}
-
 	for _, opt := range opts {
 		opt(c)
 	}
 
-	var api *slackapi.Client
-
+	apiOpts := []slackapi.Option{slackapi.OptionDebug(c.debug)}
 	if c.alternateURL != "" {
-		log.Infof("Initializing slack with alternate URL: %s", c.alternateURL)
-		api = slackapi.New(slackAPIToken, slackapi.OptionAPIURL(c.alternateURL), slackapi.OptionDebug(c.debug))
-	} else {
-		api = slackapi.New(slackAPIToken, slackapi.OptionDebug(c.debug))
+		slog.Info("initializing slack client with alternate URL", "url", c.alternateURL)
+		apiOpts = append(apiOpts, slackapi.OptionAPIURL(c.alternateURL))
 	}
-	return &Client{slackClient: api}, nil
+	c.api = slackapi.New(slackAPIToken, apiOpts...)
+	return c, nil
 }
 
-// CWAlarmHeaderBlock produces a slack block for the alarm details - regardless of state
-func (c *Client) CWAlarmHeaderBlock(evt *cw.EventDetails, prefix string) *slackapi.SectionBlock {
-	header := slackapi.NewTextBlockObject("mrkdwn", fmt.Sprintf("*%s Cloudwatch Alarm: %s*", prefix, evt.Detail.AlarmName), false, false)
-
+// HeaderBlock produces a slack block for the alarm details - regardless of state.
+func (c *Client) HeaderBlock(evt *cw.Event, prefix string) *slackapi.SectionBlock {
+	header := slackapi.NewTextBlockObject(slackapi.MarkdownType,
+		fmt.Sprintf("*%s CloudWatch Alarm: %s*", prefix, evt.Detail.AlarmName), false, false)
 	return slackapi.NewSectionBlock(header, nil, nil)
 }
 
-// CWAlarmSummary returns a slack block with the cloudwatch alarm summary (ie: metrics, reason, etc)
-func (c *Client) CWAlarmSummary(evt *cw.EventDetails) *slackapi.SectionBlock {
-	metricList := evt.MetricList()
-	metricsStrings := make([]string, 0)
-	if len(metricList[cw.MetricNamesKey]) > 0 {
-		metricsStrings = append(metricsStrings, fmt.Sprintf("Names: %s", strings.Join(metricList[cw.MetricNamesKey], ",")))
+// SummaryBlock returns a slack block with the alarm summary (metrics and state reason).
+func (c *Client) SummaryBlock(evt *cw.Event) *slackapi.SectionBlock {
+	summary := evt.MetricSummary()
+	var parts []string
+	if len(summary.Names) > 0 {
+		parts = append(parts, fmt.Sprintf("Names: %s", strings.Join(summary.Names, ",")))
 	}
-	if len(metricList[cw.MetricNamespacesKey]) > 0 {
-		metricsStrings = append(metricsStrings, fmt.Sprintf("Namespaces: %s", strings.Join(metricList[cw.MetricNamespacesKey], ",")))
+	if len(summary.Namespaces) > 0 {
+		parts = append(parts, fmt.Sprintf("Namespaces: %s", strings.Join(summary.Namespaces, ",")))
 	}
-	if len(metricList[cw.MetricDimensionsKey]) > 0 {
-		metricsStrings = append(metricsStrings, fmt.Sprintf("Dimensions: %s", strings.Join(metricList[cw.MetricDimensionsKey], ",")))
+	if len(summary.Dimensions) > 0 {
+		parts = append(parts, fmt.Sprintf("Dimensions: %s", strings.Join(summary.Dimensions, ",")))
+	}
+	if len(summary.Expressions) > 0 {
+		parts = append(parts, fmt.Sprintf("Expressions: %s", strings.Join(summary.Expressions, ",")))
 	}
 
-	var metricDataText string
-	vals, cwerr := evt.GetMetricDataRequestForHrs()
-	if cwerr != nil {
-		metricDataText = fmt.Sprintf("error fetching metrics: %v", cwerr)
+	var text string
+	if len(parts) > 0 {
+		text = fmt.Sprintf("*Metrics*: `%s`", strings.Join(parts, " - "))
 	} else {
-		metricDataText = fmt.Sprintf("%.2f @ %s", *vals.Values[0], *vals.Timestamps[0])
+		text = "*Metrics*\n`None found`"
+	}
+	if reason := evt.Detail.State.Reason; reason != "" {
+		text = fmt.Sprintf("%s\nReason: `%s`", text, reason)
 	}
 
-	var metricBlock *slackapi.TextBlockObject
-	if len(metricsStrings) > 0 {
-		metricBlock = slackapi.NewTextBlockObject("mrkdwn", fmt.Sprintf("*Metrics*: `%s`\nRecent data: `%s`", strings.Join(metricsStrings, " - "), metricDataText), false, false)
-	} else {
-		metricBlock = slackapi.NewTextBlockObject("mrkdwn", "*Metrics*\n`None found`", false, false)
-	}
-
-	return slackapi.NewSectionBlock(metricBlock, nil, nil)
+	block := slackapi.NewTextBlockObject(slackapi.MarkdownType, text, false, false)
+	return slackapi.NewSectionBlock(block, nil, nil)
 }
 
-// ImageLink adds an image ref to the given url
-func (c *Client) ImageLink(url string) *slackapi.ImageBlock {
-	imageText := slackapi.NewTextBlockObject("plain_text", "MetricData", false, false)
-	imageBlock := slackapi.NewImageBlock(url, "MetricData", "metricdata", imageText)
-	return imageBlock
+// LinkBlock adds a link to the CloudWatch console to the slack message.
+func (c *Client) LinkBlock(evt *cw.Event) *slackapi.SectionBlock {
+	link := slackapi.NewTextBlockObject(slackapi.MarkdownType,
+		fmt.Sprintf("Link: <%s|AWS Console>", evt.ConsoleLink()), false, false)
+	return slackapi.NewSectionBlock(link, nil, nil)
 }
 
-// CWAlarmLink adds a link to the cloudwatch console to the slack message
-func (c *Client) CWAlarmLink(evt *cw.EventDetails) *slackapi.SectionBlock {
-	link := evt.AlarmConsoleLink()
-	linkBlock := slackapi.NewTextBlockObject("mrkdwn", fmt.Sprintf("Link: <%s|AWS Console>", link), false, false)
-	return slackapi.NewSectionBlock(linkBlock, nil, nil)
+// imageBlock builds an image block from an ImageRef, or nil for the zero value.
+func (c *Client) imageBlock(img ImageRef) *slackapi.ImageBlock {
+	title := slackapi.NewTextBlockObject(slackapi.PlainTextType, "MetricData", false, false)
+	if img.SlackFileID != "" {
+		return &slackapi.ImageBlock{
+			Type:      slackapi.MBTImage,
+			SlackFile: &slackapi.SlackFileObject{ID: img.SlackFileID},
+			AltText:   "metric graph",
+			BlockID:   "metricdata",
+			Title:     title,
+		}
+	}
+	if img.URL != "" {
+		return slackapi.NewImageBlock(img.URL, "metric graph", "metricdata", title)
+	}
+	return nil
 }
 
-// SendEventResolved will send a resolved message given the event details
-func (c *Client) SendEventResolved(slackChannel string, evt *cw.EventDetails, imageLink string) (string, string, error) {
-	var blocks slackapi.MsgOption
-	header := c.CWAlarmHeaderBlock(evt, ":white_check_mark: (resolved)")
-	info := c.CWAlarmSummary(evt)
-	link := c.CWAlarmLink(evt)
-	if imageLink != "" {
-		graph := c.ImageLink(imageLink)
-		json, jerr := json.Marshal(slackapi.NewBlockMessage(header, info, graph, link))
-		log.Debugf("blocks json: %+v err: %v", string(json), jerr)
-		blocks = slackapi.MsgOptionBlocks(header, info, graph, link)
-	} else {
-		blocks = slackapi.MsgOptionBlocks(header, info, link)
-	}
-
-	return c.SendMessage(slackChannel, blocks)
-}
-
-// SendEventTriggered will send a triggered message given the event details
-func (c *Client) SendEventTriggered(slackChannel string, evt *cw.EventDetails, imageLink string) (string, string, error) {
-	var blocks slackapi.MsgOption
-	header := c.CWAlarmHeaderBlock(evt, ":red_alert_parrot: (triggered)")
-	info := c.CWAlarmSummary(evt)
-	link := c.CWAlarmLink(evt)
-	if imageLink != "" {
-		graph := c.ImageLink(imageLink)
-		json, jerr := json.Marshal(slackapi.NewBlockMessage(header, info, graph, link))
-		log.Debugf("blocks json: %+v err: %v", string(json), jerr)
-		blocks = slackapi.MsgOptionBlocks(header, info, graph, link)
-	} else {
-		blocks = slackapi.MsgOptionBlocks(header, info, link)
-	}
-
-	return c.SendMessage(slackChannel, blocks)
-}
-
-// SendMessage sends a message to a slack channel
-func (c *Client) SendMessage(channel string, opts ...slackapi.MsgOption) (string, string, error) {
-	log.Infof("slack.SendMessage: Sending message to channel %s", channel)
-	if c == nil {
-		log.Fatalf("self is nil!")
-	}
-	if c.slackClient == nil {
-		log.Fatalf("slack client is nil!")
-	}
-	channelID, timestamp, err := c.slackClient.PostMessage(
-		channel,
-		opts...,
-	)
-	log.Infof("channelID: %s, ts: %s, err: %v", channelID, timestamp, err)
-
+// UploadImage uploads a PNG to Slack (unshared) and returns its file ID for
+// referencing from an image block.
+func (c *Client) UploadImage(ctx context.Context, filename string, png []byte) (string, error) {
+	file, err := c.api.UploadFileContext(ctx, slackapi.UploadFileParameters{
+		Filename: filename,
+		Title:    filename,
+		FileSize: len(png),
+		Reader:   bytes.NewReader(png),
+	})
 	if err != nil {
-		return "", "", err
+		return "", fmt.Errorf("uploading %s to slack: %w", filename, err)
+	}
+	return file.ID, nil
+}
+
+// SendEventResolved will send a resolved message given the event details.
+func (c *Client) SendEventResolved(ctx context.Context, channel string, evt *cw.Event, img ImageRef) (string, string, error) {
+	return c.sendEvent(ctx, channel, evt, img, resolvedPrefix)
+}
+
+// SendEventTriggered will send a triggered message given the event details.
+func (c *Client) SendEventTriggered(ctx context.Context, channel string, evt *cw.Event, img ImageRef) (string, string, error) {
+	return c.sendEvent(ctx, channel, evt, img, triggeredPrefix)
+}
+
+func (c *Client) sendEvent(ctx context.Context, channel string, evt *cw.Event, img ImageRef, prefix string) (string, string, error) {
+	buildBlocks := func(withImage bool) []slackapi.Block {
+		blocks := []slackapi.Block{c.HeaderBlock(evt, prefix), c.SummaryBlock(evt)}
+		if withImage {
+			if imgBlock := c.imageBlock(img); imgBlock != nil {
+				blocks = append(blocks, imgBlock)
+			}
+		}
+		blocks = append(blocks, c.LinkBlock(evt))
+		return blocks
+	}
+
+	// A freshly uploaded slack file can take a moment before it is
+	// referenceable from an image block; retry briefly, then fall back to
+	// sending without the graph - the alert matters more than the image.
+	var lastErr error
+	for attempt := 0; attempt < uploadedFileAttempts; attempt++ {
+		id, ts, err := c.SendMessage(ctx, channel, slackapi.MsgOptionBlocks(buildBlocks(true)...))
+		if err == nil {
+			return id, ts, nil
+		}
+		lastErr = err
+		if img.SlackFileID == "" || !isTransientFileError(err) {
+			return "", "", err
+		}
+		slog.Warn("uploaded slack file not referenceable yet, retrying", "attempt", attempt+1, "error", err)
+		select {
+		case <-ctx.Done():
+			return "", "", ctx.Err()
+		case <-time.After(uploadedFileRetryDelay):
+		}
+	}
+	slog.Error("giving up embedding the uploaded graph, sending without it", "error", lastErr)
+	return c.SendMessage(ctx, channel, slackapi.MsgOptionBlocks(buildBlocks(false)...))
+}
+
+// isTransientFileError reports whether a postMessage failure looks like the
+// uploaded file simply isn't ready to be referenced yet.
+func isTransientFileError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "invalid_blocks") || strings.Contains(msg, "file_not_found")
+}
+
+// SendMessage sends a message to a slack channel and returns the channel ID and timestamp.
+func (c *Client) SendMessage(ctx context.Context, channel string, opts ...slackapi.MsgOption) (string, string, error) {
+	slog.Info("sending slack message", "channel", channel)
+	channelID, timestamp, err := c.api.PostMessageContext(ctx, channel, opts...)
+	if err != nil {
+		return "", "", fmt.Errorf("posting slack message to %s: %w", channel, err)
 	}
 	return channelID, timestamp, nil
 }
 
-// SendSimpleTextMessage sends a message to a slack channel
-func (c *Client) SendSimpleTextMessage(channel string, message string) (string, string, error) {
-	return c.SendMessage(channel, slackapi.MsgOptionText(message, false))
+// SendSimpleTextMessage sends a plain text message to a slack channel.
+func (c *Client) SendSimpleTextMessage(ctx context.Context, channel string, message string) (string, string, error) {
+	return c.SendMessage(ctx, channel, slackapi.MsgOptionText(message, false))
 }

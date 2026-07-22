@@ -14,118 +14,64 @@
 
 package test
 
-// Package test provides utilities and setup data for all tests
-
 import (
+	"context"
+	"fmt"
 	"io"
-	"time"
+	"sync"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/client/metadata"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3iface"
-	log "github.com/sirupsen/logrus"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	s3api "github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-// MockRetryer is the request.Retryer to use in our fake requests
-type MockRetryer struct{}
-
-// RetryRules implements said fn
-func (mr MockRetryer) RetryRules(r *request.Request) time.Duration {
-	return time.Second * 3
+// MockS3API is a mock S3 client that records written objects.
+type MockS3API struct {
+	mu      sync.Mutex
+	objects map[string][]byte
 }
 
-// ShouldRetry implements said fn
-func (mr MockRetryer) ShouldRetry(r *request.Request) bool {
-	return true
-}
-
-// MaxRetries implements said fn
-func (mr MockRetryer) MaxRetries() int {
-	return 3
-}
-
-// MockS3Client is a mock S3 client for testing
-type MockS3Client struct {
-	s3iface.S3API
-}
-
-func (m *MockS3Client) clientInfo() metadata.ClientInfo {
-	ci := metadata.ClientInfo{
-		ServiceName: "s3",
-		ServiceID:   "s3",
-		APIVersion:  "v4",
-		Endpoint:    "https://s3-fake-endpoint.fake.notexist",
+// PutObject implements the said function for the s3 client.
+func (m *MockS3API) PutObject(ctx context.Context, req *s3api.PutObjectInput, optFns ...func(*s3api.Options)) (*s3api.PutObjectOutput, error) {
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, err
 	}
-	return ci
-}
-
-var s3PutObjectChannel chan []byte
-var s3PutObjectChannelComplete chan bool
-
-// SetS3ReceiveChannel sets up a channel so we can tap into s3 object puts to just make sure we're writing what we think we are
-func SetS3ReceiveChannel(ch chan []byte, quit chan bool) {
-	s3PutObjectChannel = ch
-	s3PutObjectChannelComplete = quit
-}
-
-func writeObject(r io.Reader) {
-	go func() {
-		for {
-			buf := make([]byte, 8)
-			n, err := r.Read(buf)
-			log.Infof("sending %v (%d)", buf, n)
-			if n > 0 {
-				s3PutObjectChannel <- buf[:n]
-			}
-			if err == io.EOF {
-				break
-			}
-		}
-		log.Infof("sending quit...")
-		s3PutObjectChannelComplete <- true
-	}()
-}
-
-// PutObject implements the said function for the s3 client
-func (m *MockS3Client) PutObject(req *s3.PutObjectInput) (*s3.PutObjectOutput, error) {
-	log.Infof("mock.PutObject(%v)", req)
-	if s3PutObjectChannel != nil {
-		writeObject(req.Body)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.objects == nil {
+		m.objects = make(map[string][]byte)
 	}
-	resp := &s3.PutObjectOutput{
-		ETag: aws.String("blah"),
-	}
-	return resp, nil
+	m.objects[fmt.Sprintf("%s/%s", aws.ToString(req.Bucket), aws.ToString(req.Key))] = body
+	return &s3api.PutObjectOutput{ETag: aws.String("blah")}, nil
 }
 
-func fakeSign(i request.HandlerListRunItem) bool {
-	log.Infof("fakeSign(req)")
-	return false
+// Object returns the recorded content written to bucket/key, if any.
+func (m *MockS3API) Object(bucket, key string) ([]byte, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	obj, ok := m.objects[fmt.Sprintf("%s/%s", bucket, key)]
+	return obj, ok
 }
 
-func fakeBeforePresign(r *request.Request) error {
-	log.Infof("fakeBeforePresign(req)")
-	return nil
+// Objects returns all recorded object keys ("bucket/key").
+func (m *MockS3API) Objects() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var keys []string
+	for k := range m.objects {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
-// GetObjectRequest implements that guy
-func (m *MockS3Client) GetObjectRequest(req *s3.GetObjectInput) (*request.Request, *s3.GetObjectOutput) {
-	handlers := request.Handlers{
-		Sign: request.HandlerList{
-			AfterEachFn: fakeSign,
-		},
-	}
+// MockS3Presigner is a mock S3 presign client returning deterministic URLs.
+type MockS3Presigner struct{}
 
-	op := &request.Operation{
-		Name:            "GetObject",
-		HTTPMethod:      "GET",
-		HTTPPath:        "/get/blah/blah/blah",
-		BeforePresignFn: fakeBeforePresign,
-	}
-
-	mockRequest := request.New(aws.Config{}, m.clientInfo(), handlers, MockRetryer{}, op, nil, nil)
-
-	return mockRequest, nil
+// PresignGetObject implements the presigner interface.
+func (m *MockS3Presigner) PresignGetObject(ctx context.Context, req *s3api.GetObjectInput, optFns ...func(*s3api.PresignOptions)) (*v4.PresignedHTTPRequest, error) {
+	return &v4.PresignedHTTPRequest{
+		URL:    fmt.Sprintf("https://%s.s3.amazonaws.com/%s?X-Amz-Signature=fake", aws.ToString(req.Bucket), aws.ToString(req.Key)),
+		Method: "GET",
+	}, nil
 }

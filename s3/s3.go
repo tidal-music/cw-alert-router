@@ -12,100 +12,128 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package s3 wraps AWS S3 API in a basic interface that provides calls specific to our needs
+// Package s3 wraps the AWS S3 API in a basic interface that provides calls specific to our needs
 package s3
 
 import (
+	"context"
+	"fmt"
 	"io"
+	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
-	"github.com/aws/aws-sdk-go/aws/session"
-	s3api "github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3iface"
-	log "github.com/sirupsen/logrus"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	s3api "github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
 
-// Client is our own parameter store client
-type Client struct {
-	s3Client s3iface.S3API
-	region   string
-	roleArn  string
+// API is the subset of the S3 API this service uses.
+type API interface {
+	PutObject(ctx context.Context, params *s3api.PutObjectInput, optFns ...func(*s3api.Options)) (*s3api.PutObjectOutput, error)
 }
 
-// ClientOptions provides the ability to override client settings during initialization
+// Presigner generates presigned GET URLs for S3 objects.
+type Presigner interface {
+	PresignGetObject(ctx context.Context, params *s3api.GetObjectInput, optFns ...func(*s3api.PresignOptions)) (*v4.PresignedHTTPRequest, error)
+}
+
+// Client is our own S3 client.
+type Client struct {
+	api       API
+	presigner Presigner
+	region    string
+	roleArn   string
+}
+
+// ClientOptions provides the ability to override client settings during initialization.
 type ClientOptions func(*Client)
 
-// WithS3APIClient allows providing the AWS S3 API client instead of initializing one
-func WithS3APIClient(s3c s3iface.S3API) ClientOptions {
+// WithAPI allows providing the S3 API client instead of initializing one (for testing).
+func WithAPI(api API) ClientOptions {
 	return func(c *Client) {
-		c.s3Client = s3c
+		c.api = api
 	}
 }
 
-// WithRegion allows specifying the region we're operating in
+// WithPresigner allows providing the presigner instead of initializing one (for testing).
+func WithPresigner(p Presigner) ClientOptions {
+	return func(c *Client) {
+		c.presigner = p
+	}
+}
+
+// WithRegion allows specifying the region of the bucket we write to.
 func WithRegion(r string) ClientOptions {
 	return func(c *Client) {
 		c.region = r
 	}
 }
 
-// WithRoleARN allows specifying a role ARN to assume for S3 operations
+// WithRoleARN allows specifying a role ARN to assume for S3 operations.
 func WithRoleARN(r string) ClientOptions {
 	return func(c *Client) {
 		c.roleArn = r
 	}
 }
 
-// New returns a new Client instance
-func New(opts ...ClientOptions) (*Client, error) {
+// New returns a new Client instance.
+func New(ctx context.Context, opts ...ClientOptions) (*Client, error) {
 	c := &Client{}
-
 	for _, opt := range opts {
 		opt(c)
 	}
 
-	if c.s3Client == nil {
-		cfg := &aws.Config{}
-		sess := session.Must(session.NewSession())
+	if c.api == nil {
+		var loadOpts []func(*config.LoadOptions) error
 		if c.region != "" {
-			log.Infof("s3: overriding default region to %s", c.region)
-			cfg.Region = aws.String(c.region)
+			loadOpts = append(loadOpts, config.WithRegion(c.region))
+		}
+		cfg, err := config.LoadDefaultConfig(ctx, loadOpts...)
+		if err != nil {
+			return nil, fmt.Errorf("loading aws config for s3: %w", err)
 		}
 		if c.roleArn != "" {
-			log.Infof("s3: using role arn: %s", c.roleArn)
-			cfg.Credentials = stscreds.NewCredentials(sess, c.roleArn)
+			provider := stscreds.NewAssumeRoleProvider(sts.NewFromConfig(cfg), c.roleArn)
+			cfg.Credentials = aws.NewCredentialsCache(provider)
 		}
-		c.s3Client = s3api.New(sess, cfg)
+		client := s3api.NewFromConfig(cfg)
+		c.api = client
+		if c.presigner == nil {
+			c.presigner = s3api.NewPresignClient(client)
+		}
 	}
 
 	return c, nil
 }
 
-// WriteBytes writes the given bytes to an object key
-func (c *Client) WriteBytes(bucket string, key string, r io.ReadSeeker) error {
-	req := &s3api.PutObjectInput{
+// WriteBytes writes the given bytes to an object key.
+func (c *Client) WriteBytes(ctx context.Context, bucket string, key string, r io.Reader) error {
+	_, err := c.api.PutObject(ctx, &s3api.PutObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
-		ACL:    aws.String("private"),
+		ACL:    s3types.ObjectCannedACLPrivate,
 		Body:   r,
-	}
-	// we don't really need to check the response for anything... just need to know if it worked or not
-	_, err := c.s3Client.PutObject(req)
+	})
 	if err != nil {
-		return err
+		return fmt.Errorf("writing s3://%s/%s: %w", bucket, key, err)
 	}
 	return nil
 }
 
-// GetObjectLink creates a presigned url to the given object
-//func (c *Client) GetObjectLink(bucket string, key string) (string, error) {
-//	req, _ := c.s3Client.GetObjectRequest(&s3api.GetObjectInput{
-//		Bucket: aws.String(bucket),
-//		Key:    aws.String(key),
-//	})
-//	if req == nil {
-//		return "", fmt.Errorf("request was nil")
-//	}
-//	return req.Presign(7 * time.Hour * 24)
-//}
+// PresignedURL returns a presigned GET URL for the given object.
+func (c *Client) PresignedURL(ctx context.Context, bucket string, key string, ttl time.Duration) (string, error) {
+	if c.presigner == nil {
+		return "", fmt.Errorf("no presigner configured")
+	}
+	req, err := c.presigner.PresignGetObject(ctx, &s3api.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	}, s3api.WithPresignExpires(ttl))
+	if err != nil {
+		return "", fmt.Errorf("presigning s3://%s/%s: %w", bucket, key, err)
+	}
+	return req.URL, nil
+}

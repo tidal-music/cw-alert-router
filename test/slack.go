@@ -14,55 +14,124 @@
 
 package test
 
-// Package test provides utilities and setup data for all tests
-
 import (
 	"encoding/json"
-	"io/ioutil"
+	"fmt"
+	"io"
 	"net/http"
-
-	slackapi "github.com/slack-go/slack"
-
-	log "github.com/sirupsen/logrus"
+	"net/http/httptest"
+	"sync"
 )
 
-var slackMessageChannel chan []byte
+// SlackServer is a fake Slack API server for testing. It records posted
+// messages and uploaded files, and implements the chat.postMessage and
+// files.uploadV2 (getUploadURLExternal/completeUploadExternal) flows.
+type SlackServer struct {
+	Server *httptest.Server
 
-// GetSlackMessageChannel allows hooking into the SendSlackMessage callback (to inspect messages)
-func GetSlackMessageChannel() <-chan []byte {
-	slackMessageChannel = make(chan []byte, 1)
-	return slackMessageChannel
+	mu       sync.Mutex
+	messages [][]byte
+	uploads  map[string][]byte
+	fileSeq  int
 }
 
-// SendSlackMessage is for sending a test slack message (should have started a test server that listens to /chat.PostMessage - see slack_test.go)
-func SendSlackMessage(rw http.ResponseWriter, r *http.Request) {
+// NewSlackServer starts a fake Slack API server.
+func NewSlackServer() *SlackServer {
+	s := &SlackServer{uploads: make(map[string][]byte)}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/chat.postMessage", s.postMessage)
+	mux.HandleFunc("/files.getUploadURLExternal", s.getUploadURL)
+	mux.HandleFunc("/upload/", s.upload)
+	mux.HandleFunc("/files.completeUploadExternal", s.completeUpload)
+	s.Server = httptest.NewServer(mux)
+	return s
+}
 
+// APIURL returns the base URL to pass as the Slack client's alternative API URL.
+func (s *SlackServer) APIURL() string {
+	return s.Server.URL + "/"
+}
+
+// Close shuts the server down.
+func (s *SlackServer) Close() {
+	s.Server.Close()
+}
+
+// Messages returns the raw chat.postMessage request bodies received so far.
+func (s *SlackServer) Messages() [][]byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([][]byte(nil), s.messages...)
+}
+
+// Uploads returns the uploaded file contents by file ID.
+func (s *SlackServer) Uploads() map[string][]byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string][]byte, len(s.uploads))
+	for k, v := range s.uploads {
+		out[k] = v
+	}
+	return out
+}
+
+func writeJSON(rw http.ResponseWriter, v any) {
 	rw.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(rw).Encode(v)
+}
 
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		log.Errorf("error reading request body: %v", err)
-	} else {
-		if slackMessageChannel != nil {
-			log.Printf("sending request body to (go) channel....")
-			slackMessageChannel <- body
+func (s *SlackServer) postMessage(rw http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	s.mu.Lock()
+	s.messages = append(s.messages, body)
+	s.mu.Unlock()
+
+	writeJSON(rw, map[string]any{
+		"ok":      true,
+		"channel": "XVB123123123",
+		"ts":      "123123123123123",
+	})
+}
+
+func (s *SlackServer) getUploadURL(rw http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	s.fileSeq++
+	fileID := fmt.Sprintf("F%07d", s.fileSeq)
+	s.mu.Unlock()
+
+	writeJSON(rw, map[string]any{
+		"ok":         true,
+		"upload_url": fmt.Sprintf("%s/upload/%s", s.Server.URL, fileID),
+		"file_id":    fileID,
+	})
+}
+
+func (s *SlackServer) upload(rw http.ResponseWriter, r *http.Request) {
+	fileID := r.URL.Path[len("/upload/"):]
+
+	var content []byte
+	if err := r.ParseMultipartForm(10 << 20); err == nil {
+		if f, _, ferr := r.FormFile("file"); ferr == nil {
+			content, _ = io.ReadAll(f)
+			f.Close()
 		}
 	}
+	s.mu.Lock()
+	s.uploads[fileID] = content
+	s.mu.Unlock()
 
-	response, _ := json.Marshal(struct {
-		slackapi.SlackResponse
-		Channel            string `json:"channel"`
-		Timestamp          string `json:"ts"`
-		MessageTimeStamp   string `json:"message_ts"`
-		ScheduledMessageID string `json:"scheduled_message_id,omitempty"`
-		Text               string `json:"text"`
-	}{
-		SlackResponse:      slackapi.SlackResponse{Ok: true},
-		Channel:            "XVB123123123",
-		Timestamp:          "123123123123123",
-		MessageTimeStamp:   "123123123123123",
-		ScheduledMessageID: "ASDGADASDGSDG",
-		Text:               "This is a message?",
+	writeJSON(rw, map[string]any{"ok": true})
+}
+
+func (s *SlackServer) completeUpload(rw http.ResponseWriter, r *http.Request) {
+	r.ParseForm()
+	var files []map[string]string
+	if err := json.Unmarshal([]byte(r.FormValue("files")), &files); err != nil || len(files) == 0 {
+		writeJSON(rw, map[string]any{"ok": false, "error": "invalid_arguments"})
+		return
+	}
+	writeJSON(rw, map[string]any{
+		"ok":    true,
+		"files": files,
 	})
-	rw.Write(response)
 }
