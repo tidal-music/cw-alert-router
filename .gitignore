@@ -1,6 +1,9 @@
 .vscode
 function.zip
+bootstrap
 .DS_Store
 coverage.out
 coverage.xml
 cw-alert-router
+examples/terraform/.terraform*
+examples/terraform/terraform.tfstate*

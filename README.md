@@ -1,65 +1,158 @@
-# Cloudwatch Alert Router
+# CloudWatch Alert Router
 
-![build&test](https://github.com/tidal-open-source/cw-alert-router/actions/workflows/main.yml/badge.svg)
+![build&test](https://github.com/tidal-music/cw-alert-router/actions/workflows/main.yml/badge.svg)
 
-Cloudwatch Alert Router is a simple lambda that will take cloudwatch alarms (via 
-event bridge) and deliver them to Slack and/or PagerDuty depending.
+CloudWatch Alert Router is a small AWS Lambda that takes CloudWatch alarm
+state changes (via EventBridge and SQS) and delivers them to **Slack** and/or
+**PagerDuty** - with a rendered metric graph attached.
 
-Slack channels and PagerDuty delivery can be configured via AWS tags on the
-Cloudwatch alarms.
+Why? Waiting for a third-party monitoring platform to crawl CloudWatch
+metrics can add 10-15+ minutes before anyone gets paged. Routing the alarm
+state change event directly gets the alert out within seconds.
 
+```
+CloudWatch Alarm ──> EventBridge rule ──> SQS queue ──> Lambda ──┬──> Slack (+ graph)
+                                                                 └──> PagerDuty
+```
 
-# API keys
+Routing is controlled by **AWS tags on the alarm** - no configuration files
+to maintain as teams add alarms.
 
+## How routing works
 
-# Minimum required environment variables
+| Tag on the alarm | Effect |
+|:--|:--|
+| `owner` | Slack messages go to `<owner>-alarms` (lowercased) |
+| `service` | PagerDuty routing key is looked up in Parameter Store at `/service/cw_alert_router/pagerduty/routing_keys/<service>` (lowercased, `-` → `_`) |
+| `alerts:slack_channel` | Overrides the Slack channel entirely |
+| `alerts:suppress_pagerduty` | `"true"` = skip PagerDuty for this alarm (Slack still gets the message) |
 
-These are required to be set, otherwise the application may not run correctly.
+If no tag matches, the default Slack channel and default PagerDuty routing
+key (from the environment) are used. Only `OK -> ALARM` (trigger) and
+`ALARM -> OK` (resolve) transitions are routed; everything else is ignored.
 
-|Environment variable|Description|Example|
-|:--------------------|:---------|:------|
-|`DEFAULT_SLACK_CHANNEL`|Default slack channel where alarms are sent if no channel can be inferred|`test-alarms`|
-|`SLACK_TOKEN_SSM_KEY`|The SSM Parameter name where your Slack Oauth access token is stored|`/lambda/my-lambda-name/slack/app/oauth/access_token`|
-|`PAGERDUTY_DEFAULT_ROUTING_KEY`|Default PagerDuty routing key (otherwise some logic is used to search for a key in SSM)|`xxxxxxx`|
-|`IMAGE_BUCKET`|Name of the S3 bucket where temporary graphs are stored|`my-bucket-name`|
-|`IMAGE_BUCKET_REGION`|Region of the bucket|`us-west-2`|
-|`IMAGE_HOST`||`https://my-bucket-cdn.mysite.com`|
+## Graphs
 
-# Optional environment variables
+Graphs are rendered server-side by CloudWatch
+([`GetMetricWidgetImage`](https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_GetMetricWidgetImage.html))
+with the alarm's own threshold annotation - metric math and multi-metric
+alarms work out of the box. Delivery is controlled by `GRAPH_MODE`:
 
-The following environment variables are optional
+| Mode | Behaviour |
+|:--|:--|
+| `slack` (default) | The PNG is uploaded to Slack and embedded in the message. No bucket or CDN needed. |
+| `s3` | The PNG is written to `IMAGE_BUCKET` and linked via `IMAGE_HOST` (e.g. a CloudFront distribution), or a presigned URL if `IMAGE_HOST` is unset. |
+| `none` | No graph. |
 
-| Environment variable | Description | Default | Example |
-|:----------------------|:------------|:--------|:--------|
-|`IMAGE_BUCKET_ROLE_ARN`|Role we need to assume to write to the image bucket (leave empty to use the lambda role)|`""`|`arn:aws:iam::123456789012:role/role_with_bucket_access`|
-|`LOG_LEVEL`|Log level|`INFO`|`DEBUG`|
-|`OWNER_TAG_KEY`|AWS tag to determine who owns the alarm - used to infer the slack channel name (<team>-alarms)|`owner`||
-|`APP_NAME_TAG_KEY`|AWS tag for the service that owns the alarm - used to infer a pagerduty routing key from ssm (eg: /service/cw_alert_router/pagerduty/routing_keys/<app-name>)|`service`||
+If `GRAPH_MODE` is unset but `IMAGE_BUCKET` is configured, `s3` is assumed
+(backwards compatible with v1 deployments).
 
+## Configuration
 
-# Getting started
+Required environment variables:
 
-A simple example of how to get the lambda up and running:
+| Environment variable | Description | Example |
+|:--|:--|:--|
+| `DEFAULT_SLACK_CHANNEL` | Fallback channel when no owner can be inferred | `test-alarms` |
+| `SLACK_TOKEN_SSM_KEY` | Parameter Store key holding the Slack bot token | `/service/cw_alert_router/slack/token` |
+| `PAGERDUTY_DEFAULT_ROUTING_KEY` | Fallback PagerDuty Events API v2 routing key | `xxxxxxx` |
+
+Optional environment variables:
+
+| Environment variable | Description | Default |
+|:--|:--|:--|
+| `GRAPH_MODE` | Graph delivery: `slack`, `s3` or `none` | `slack` |
+| `OWNER_TAG_KEY` | Tag key used to derive the Slack channel | `owner` |
+| `SERVICE_NAME_TAG_KEY` | Tag key used to look up the PagerDuty routing key | `service` |
+| `LOG_LEVEL` | `debug`, `info`, `warn` or `error` | `info` |
+| `IMAGE_BUCKET` | Bucket for graph images (`s3` mode only) | |
+| `IMAGE_BUCKET_REGION` | Region of the image bucket | lambda's region |
+| `IMAGE_BUCKET_ROLE_ARN` | Role to assume for bucket writes (empty = lambda role) | |
+| `IMAGE_BUCKET_PREFIX` | Key prefix for graph images | |
+| `IMAGE_HOST` | Public host serving the bucket (e.g. CloudFront); presigned URLs if empty | |
+
+## Setting up the API keys
+
+**Slack**: create a [Slack app](https://api.slack.com/apps), add the bot
+token scopes `chat:write`, `chat:write.public` and `files:write`, install it
+to your workspace, and store the bot token (`xoxb-...`) in Parameter Store as
+a SecureString:
+
+```sh
+aws ssm put-parameter --name /service/cw_alert_router/slack/token \
+  --type SecureString --value xoxb-your-token
+```
+
+Private channels need the bot invited (`/invite @your-app`).
+
+**PagerDuty**: on each PagerDuty service, add an *Events API v2* integration
+and copy its routing key. Use one as the default
+(`PAGERDUTY_DEFAULT_ROUTING_KEY`) and optionally register per-service keys:
+
+```sh
+aws ssm put-parameter --name /service/cw_alert_router/pagerduty/routing_keys/my_service \
+  --type SecureString --value your-routing-key
+```
+
+## Deploying
+
+A complete, copy-pasteable Terraform deployment (EventBridge rule, SQS queue
+with dead-letter queue, Lambda, IAM) lives in
+[`examples/terraform`](examples/terraform/) - see its README for a 5-step
+walkthrough.
+
+The short version:
+
+```sh
+task publish          # builds function.zip (arm64 bootstrap, provided.al2023) via docker
+# or without docker:
+task build-local
+```
+
+Deploy `function.zip` on the `provided.al2023` runtime (arm64), wire an
+EventBridge rule for `CloudWatch Alarm State Change` events into an SQS
+queue consumed by the Lambda, and set the environment variables above. The
+SQS event source mapping should enable `ReportBatchItemFailures` - the
+handler reports failures per message so one bad event doesn't re-deliver
+(and re-alert) the whole batch.
+
+The Lambda role needs: `cloudwatch:ListTagsForResource`,
+`cloudwatch:GetMetricWidgetImage`, `ssm:GetParameter` on the keys above, and
+the usual SQS consume + CloudWatch Logs permissions (plus `s3:PutObject` on
+the image bucket in `s3` graph mode).
+
+## Using as a library
+
+The lambda is also usable as a library if you want to customize the entrypoint:
 
 ```go
 package main
 
 import (
-	log "github.com/sirupsen/logrus"
-	"github.com/tidal-open-source/cw-alert-router/lambda"
+	"context"
+	"log/slog"
+	"os"
+
+	"github.com/tidal-music/cw-alert-router/v2/lambda"
 )
 
 func main() {
-	cfg, err := lambda.NewConfig()
-
+	h, err := lambda.New(context.Background(), lambda.ConfigFromEnv())
 	if err != nil {
-		log.Fatalf("Error initializing lambda: %v", err)
+		slog.Error("failed initializing lambda", "error", err)
+		os.Exit(1)
 	}
-
-	lambda.SetConfig(cfg)
-	lambda.Start()
+	h.Start()
 }
 ```
 
-Compile and upload the lambda - then set the required (and/or optional) environment variables to configure the service to your needs.
+Every dependency (CloudWatch, Parameter Store, PagerDuty, Slack, S3) can be
+overridden via `lambda.With*` options - see `lambda/handler_test.go` for
+examples.
 
+## Development
+
+```sh
+go test ./...   # or: task test
+task build      # docker image + function.zip
+```
