@@ -9,10 +9,23 @@ jobs:
 
         steps:
           - name: checkout
-            uses: actions/checkout@v3
-          - name: Install task
-            run: sudo sh -c "$(curl --location https://taskfile.dev/install.sh)" -- -d -b /usr/local/bin
+            uses: actions/checkout@v4
+          - name: Set up Go
+            uses: actions/setup-go@v5
+            with:
+              go-version-file: go.mod
+          - name: Vet
+            run: go vet ./...
+          - name: Check formatting
+            run: test -z "$(gofmt -l .)"
           - name: Run tests
-            run: task test
-          - name: Build
-            run: task build
+            run: go test -v ./...
+          - name: Build lambda package
+            run: |
+              CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -tags lambda.norpc -o bootstrap .
+              zip function.zip bootstrap
+          - name: Upload function.zip
+            uses: actions/upload-artifact@v4
+            with:
+              name: function-zip
+              path: function.zip

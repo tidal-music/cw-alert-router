@@ -12,25 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package test provides utilities and setup data for all tests
 package test
 
-// Package test provides utilities and setup data for all tests
-
 import (
+	"context"
 	"crypto/md5"
 	"fmt"
 	"io"
-	"regexp"
-	"time"
-
-	"github.com/tidal-open-source/cw-alert-router/cw"
 
 	awsevents "github.com/aws/aws-lambda-go/events"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/service/cloudwatch"
-	"github.com/aws/aws-sdk-go/service/cloudwatch/cloudwatchiface"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
+	cwtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
+
+	"github.com/tidal-music/cw-alert-router/v2/cw"
 )
+
+// TestPNG is a minimal valid PNG (1x1 transparent pixel) returned by the mock
+// GetMetricWidgetImage.
+var TestPNG = []byte{
+	0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+	0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+	0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00,
+	0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+	0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
+	0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+}
 
 var (
 	// TestEventJSONFromSQS - a test event as seen from eventbridge -> SQS -> lambda
@@ -99,71 +107,30 @@ var (
 		},
 	}
 
-	TestSuppressPagerDuty = cw.AlarmEventDetail{
-		AlarmName: "arn:aws:cloudwatch:us-east-1:1234567890123:alarm:test-service-alarm-abcd",
-		State: cw.AlarmState{
-			Value:      "ALARM",
-			Timestamp:  "2022-09-29T22:10:04.692+0000",
-			ReasonData: "{\\\"version\\\":\\\"1.0\\\",\\\"queryDate\\\":\\\"2022-09-29T22:10:04.689+0000\\\",\\\"startDate\\\":\\\"2022-09-29T21:40:00.000+0000\\\",\\\"statistic\\\":\\\"Sum\\\",\\\"period\\\":300,\\\"recentDatapoints\\\":[0.0,0.0,0.0,0.0,0.0,0.0],\\\"threshold\\\":0.0,\\\"evaluatedDatapoints\\\":[{\\\"timestamp\\\":\\\"2022-09-29T22:05:00.000+0000\\\",\\\"sampleCount\\\":5.0,\\\"value\\\":0.0},{\\\"timestamp\\\":\\\"2022-09-29T22:00:00.000+0000\\\",\\\"sampleCount\\\":5.0,\\\"value\\\":0.0},{\\\"timestamp\\\":\\\"2022-09-29T21:55:00.000+0000\\\",\\\"sampleCount\\\":5.0,\\\"value\\\":0.0},{\\\"timestamp\\\":\\\"2022-09-29T21:50:00.000+0000\\\",\\\"sampleCount\\\":5.0,\\\"value\\\":0.0},{\\\"timestamp\\\":\\\"2022-09-29T21:45:00.000+0000\\\",\\\"sampleCount\\\":5.0,\\\"value\\\":0.0},{\\\"timestamp\\\":\\\"2022-09-29T21:40:00.000+0000\\\",\\\"sampleCount\\\":5.0,\\\"value\\\":0.0}]}",
-			Reason:     "Threshold Crossed: 6 datapoints were less than or equal to the threshold (0.0). The most recent datapoints which crossed the threshold: [0.0 (29/09/22 22:05:00), 0.0 (29/09/22 22:00:00), 0.0 (29/09/22 21:55:00), 0.0 (29/09/22 21:50:00), 0.0 (29/09/22 21:45:00)].",
-		},
-		PreviousState: cw.AlarmState{
-			Value:      "OK",
-			Timestamp:  "2022-08-29T13:09:04.688+0000",
-			ReasonData: "{\\\"version\\\":\\\"1.0\\\",\\\"queryDate\\\":\\\"2022-08-29T13:09:04.685+0000\\\",\\\"startDate\\\":\\\"2022-08-29T12:39:00.000+0000\\\",\\\"statistic\\\":\\\"Sum\\\",\\\"period\\\":300,\\\"recentDatapoints\\\":[0.0,0.0,0.0,0.0,0.0,9.0],\\\"threshold\\\":0.0,\\\"evaluatedDatapoints\\\":[{\\\"timestamp\\\":\\\"2022-08-29T13:04:00.000+0000\\\",\\\"sampleCount\\\":14.0,\\\"value\\\":9.0}]}",
-			Reason:     "Threshold Crossed: 1 datapoint [9.0 (29/08/22 13:04:00)] was not less than or equal to the threshold (0.0).",
-		},
-		Tags: cw.AlarmTags{
-			"Env":                       "test",
-			"alerts:suppress_pagerduty": "true",
-			"service":                   "test-service",
-			"owner":                     "test",
-		},
-		Configuration: cw.AlarmConfiguration{
-			Metrics: []cw.AlarmMetric{
-				{
-					ReturnData: true,
-					ID:         "76bafab0-8d7b-65d4-ad90-808e4af8f7dd",
-					MetricStat: cw.AlarmMetricStat{
-						Stat:   "Sum",
-						Period: 300,
-						Metric: cw.AlarmMetricDetail{
-							Namespace: "AWS/SQS",
-							Name:      "NumberOfEmptyReceives",
-							Dimensions: map[string]string{
-								"QueueName": "testQueue.fifo",
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	// TestOKAlarm is just a test cloudwatch alarm used for various tests (in the OK state)
-	TestOKAlarm = cw.AlarmEventDetail{
+	// TestOKAlarm is just a test cloudwatch alarm detail used for various tests (in the OK state)
+	TestOKAlarm = cw.AlarmStateChange{
 		AlarmName: "test-service-alarm-abcd",
-		State: cw.AlarmState{
+		State: cw.State{
 			Value:      "OK",
 			Timestamp:  "2020-07-31T06:56:05.606+0000",
 			ReasonData: "{\"version\":\"1.0\",\"queryDate\":\"2020-07-31T06:56:05.603+0000\",\"startDate\":\"2020-07-31T06:50:00.000+0000\",\"statistic\":\"Average\",\"period\":60,\"recentDatapoints\":[0.2872183414376726],\"threshold\":60.0}",
 			Reason:     "Threshold Crossed: 1 datapoint [0.2872183414376726 (31/07/20 06:50:00)] was not greater than the threshold (60.0).",
 		},
-		PreviousState: cw.AlarmState{
+		PreviousState: cw.State{
 			Value:      "INSUFFICIENT_DATA",
 			Timestamp:  "2020-07-31T06:52:05.601+0000",
 			ReasonData: "{\"version\":\"1.0\",\"queryDate\":\"2020-07-31T06:52:05.598+0000\",\"statistic\":\"Average\",\"period\":60,\"recentDatapoints\":[],\"threshold\":60.0}",
 			Reason:     "Insufficient Data: 1 datapoint was unknown.",
 		},
-		Configuration: cw.AlarmConfiguration{
-			Metrics: []cw.AlarmMetric{
+		Configuration: cw.Configuration{
+			Metrics: []cw.MetricDataQuery{
 				{
 					ReturnData: true,
 					ID:         "beb9cf5d-585d-3d43-179b-1e0898d8e237",
-					MetricStat: cw.AlarmMetricStat{
+					MetricStat: &cw.MetricStat{
 						Stat:   "Average",
 						Period: 60,
-						Metric: cw.AlarmMetricDetail{
+						Metric: cw.Metric{
 							Namespace: "AWS/EC2",
 							Name:      "CPUUtilization",
 							Dimensions: map[string]string{
@@ -176,80 +143,26 @@ var (
 		},
 	}
 
-	// TestNoDataToOKAlarm is for testing with an alarm that just transitioned to OK from INSUFFICIENT_DATA
-	TestNoDataToOKAlarm = cw.AlarmEventDetail{
-		AlarmName: "test-123-alarm-aabe21de-1236-4742-bf18-34b1c3b2682a",
-		State: cw.AlarmState{
-			Value:      "OK",
-			Timestamp:  "2020-11-11T06:56:05.606+0000",
-			ReasonData: "{\"version\":\"1.0\",\"queryDate\":\"2020-11-11T06:56:05.603+0000\",\"startDate\":\"2020-11-11T06:50:00.000+0000\",\"statistic\":\"Average\",\"period\":60,\"recentDatapoints\":[0.2872183414376726],\"threshold\":60.0}",
-			Reason:     "Threshold Crossed: 1 datapoint [200.0 (11/11/20 06:50:00)] was greater than the threshold (60.0).",
-		},
-		PreviousState: cw.AlarmState{
-			Value:      "INSUFFICIENT_DATA",
-			Timestamp:  "2020-11-11T06:52:05.601+0000",
-			ReasonData: "{\"version\":\"1.0\",\"queryDate\":\"2020-11-11T06:52:05.598+0000\",\"statistic\":\"Average\",\"period\":60,\"recentDatapoints\":[],\"threshold\":60.0}",
-			Reason:     "Insufficient Data: 1 datapoint was unknown.",
-		},
-		Configuration: cw.AlarmConfiguration{
-			Metrics: []cw.AlarmMetric{
-				{
-					ReturnData: true,
-					ID:         "1eb9cf5d-a85d-3d43-179c-1e0898d8e237",
-					MetricStat: cw.AlarmMetricStat{
-						Stat:   "Average",
-						Period: 60,
-						Metric: cw.AlarmMetricDetail{
-							Namespace: "AWS/EC2",
-							Name:      "CPUUtilization",
-							Dimensions: map[string]string{
-								"AutoScalingGroupName": "test-123",
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	// TestTriggeredAlarm is just a test cloudwatch alarm used for various tests (in the OK state)
-	TestTriggeredAlarm = cw.AlarmEventDetail{
+	// TestTriggeredAlarm is TestOKAlarm transitioned into the ALARM state
+	TestTriggeredAlarm = cw.AlarmStateChange{
 		AlarmName: "test-service-alarm-abcd",
-		State: cw.AlarmState{
+		State: cw.State{
 			Value:      "ALARM",
 			Timestamp:  "2020-07-31T06:56:05.606+0000",
 			ReasonData: "{\"version\":\"1.0\",\"queryDate\":\"2020-07-31T06:56:05.603+0000\",\"startDate\":\"2020-07-31T06:50:00.000+0000\",\"statistic\":\"Average\",\"period\":60,\"recentDatapoints\":[0.2872183414376726],\"threshold\":60.0}",
 			Reason:     "Threshold Crossed: 1 datapoint [200.0 (31/07/20 06:50:00)] was greater than the threshold (60.0).",
 		},
-		PreviousState: cw.AlarmState{
+		PreviousState: cw.State{
 			Value:      "INSUFFICIENT_DATA",
 			Timestamp:  "2020-07-31T06:52:05.601+0000",
 			ReasonData: "{\"version\":\"1.0\",\"queryDate\":\"2020-07-31T06:52:05.598+0000\",\"statistic\":\"Average\",\"period\":60,\"recentDatapoints\":[],\"threshold\":60.0}",
 			Reason:     "Insufficient Data: 1 datapoint was unknown.",
 		},
-		Configuration: cw.AlarmConfiguration{
-			Metrics: []cw.AlarmMetric{
-				{
-					ReturnData: true,
-					ID:         "beb9cf5d-585d-3d43-179b-1e0898d8e237",
-					MetricStat: cw.AlarmMetricStat{
-						Stat:   "Average",
-						Period: 60,
-						Metric: cw.AlarmMetricDetail{
-							Namespace: "AWS/EC2",
-							Name:      "CPUUtilization",
-							Dimensions: map[string]string{
-								"AutoScalingGroupName": "test-service",
-							},
-						},
-					},
-				},
-			},
-		},
+		Configuration: TestOKAlarm.Configuration,
 	}
 
-	// ExpectedAlarmDetails is the parsed struct of the above JSON
-	ExpectedAlarmDetails = cw.EventDetails{
+	// ExpectedAlarmDetails is the parsed struct of TestEventJSON
+	ExpectedAlarmDetails = cw.Event{
 		Account: "1234567890123",
 		Version: "0",
 		Time:    "2020-07-31T06:56:05Z",
@@ -263,8 +176,8 @@ var (
 		Detail:     TestOKAlarm,
 	}
 
-	// TriggeredAlarmDetails is a sample CW alarm in ALARM state
-	TriggeredAlarmDetails = cw.EventDetails{
+	// TriggeredAlarmDetails is a sample CW alarm event in ALARM state
+	TriggeredAlarmDetails = cw.Event{
 		Account: "1234567890123",
 		Version: "0",
 		Time:    "2020-07-31T06:56:05Z",
@@ -278,128 +191,69 @@ var (
 		Detail:     TestTriggeredAlarm,
 	}
 
-	// InsufficientDataToOKAlarmDetails is for testing insufficient data -> ok alarm
-	InsufficientDataToOKAlarmDetails = cw.EventDetails{
-		Account: "1234567890123456",
-		Version: "0",
-		Time:    "2020-11-11T06:56:05Z",
-		Source:  "aws.cloudwatch",
-		Resources: []string{
-			"arn:aws:cloudwatch:us-east-1:1234567890123:alarm:test-service-alarm-abcd",
-		},
-		Region:     "us-east-1",
-		ID:         "1ebd31a7-11e5-b52a-03e4-be4110b0f1e0",
-		DetailType: "CloudWatch Alarm State Change",
-		Detail:     TestNoDataToOKAlarm,
-	}
-
-	// SuppressPagerDutyTrue is for testing events with disabled PD alerts
-	SuppressPagerDutyTrue = cw.EventDetails{
+	// SuppressedAlarmDetails is TriggeredAlarmDetails pointed at an alarm
+	// whose tags carry alerts:suppress_pagerduty=true (see TagsByARN).
+	SuppressedAlarmDetails = cw.Event{
 		Account: "1234567890123",
 		Version: "0",
-		Time:    "2022-09-29T22:10:04Z",
+		Time:    "2020-07-31T06:56:05Z",
 		Source:  "aws.cloudwatch",
 		Resources: []string{
-			"arn:aws:cloudwatch:us-east-1:1234567890123:alarm:test-service-alarm-abcd",
+			"arn:aws:cloudwatch:us-east-1:1234567890123:alarm:suppressed-alarm",
 		},
 		Region:     "us-east-1",
 		ID:         "0cd5bdb7-df8b-f066-50c5-cc06faac60c2",
 		DetailType: "CloudWatch Alarm State Change",
-		Detail:     TestSuppressPagerDuty,
+		Detail:     TestTriggeredAlarm,
 	}
 
-	_listTagsForResourceResponses = map[string]*cloudwatch.ListTagsForResourceOutput{
+	// TagsByARN holds the tags the mock CloudWatch client returns per alarm ARN.
+	TagsByARN = map[string]map[string]string{
 		"arn:aws:cloudwatch:us-east-1:1234567890123:alarm:test-service-alarm-abcd": {
-			Tags: []*cloudwatch.Tag{
-				{
-					Key:   aws.String("owner"),
-					Value: aws.String("test"),
-				},
-				{
-					Key:   aws.String("service"),
-					Value: aws.String("test-service"),
-				},
-			},
+			"owner":   "test",
+			"service": "test-service",
 		},
 		"arn:aws:cloudwatch:us-east-1:1234567890123:alarm:test-service_aurora_serverless_cpu_utilization": {
-			Tags: []*cloudwatch.Tag{
-				{
-					Key:   aws.String("owner"),
-					Value: aws.String("test"),
-				},
-				{
-					Key:   aws.String("service"),
-					Value: aws.String("test-service"),
-				},
-			},
+			"owner":   "test",
+			"service": "test-service",
 		},
-	}
-
-	// GetMetricDataResponses provides some test GetMetricData api responses map key is the MetricDataQuery.Id
-	GetMetricDataResponses = map[string]*cloudwatch.GetMetricDataOutput{
-		"m0": {
-			MetricDataResults: []*cloudwatch.MetricDataResult{
-				{
-					Id: aws.String("m0"),
-					Timestamps: []*time.Time{
-						aws.Time(time.Date(2020, time.October, 30, 15, 0, 0, 0, time.UTC)),
-						aws.Time(time.Date(2020, time.October, 30, 15, 5, 0, 0, time.UTC)),
-						aws.Time(time.Date(2020, time.October, 30, 15, 10, 0, 0, time.UTC)),
-						aws.Time(time.Date(2020, time.October, 30, 15, 15, 0, 0, time.UTC)),
-						aws.Time(time.Date(2020, time.October, 30, 15, 20, 0, 0, time.UTC)),
-						aws.Time(time.Date(2020, time.October, 30, 15, 25, 0, 0, time.UTC)),
-					},
-					Values: []*float64{
-						aws.Float64(15.0),
-						aws.Float64(3.0),
-						aws.Float64(11.0),
-						aws.Float64(9.0),
-						aws.Float64(17.0),
-						aws.Float64(15.0),
-					},
-				},
-			},
+		"arn:aws:cloudwatch:us-east-1:1234567890123:alarm:suppressed-alarm": {
+			"owner":                     "test",
+			"service":                   "test-service",
+			"alerts:suppress_pagerduty": "true",
 		},
 	}
 )
 
-// MockCWClient is a mock Cloudwatch client for testing
-type MockCWClient struct {
-	cloudwatchiface.CloudWatchAPI
+// MockCWAPI is a mock CloudWatch API for testing.
+type MockCWAPI struct {
+	// LastWidgetJSON records the widget definition of the most recent
+	// GetMetricWidgetImage call.
+	LastWidgetJSON string
 }
 
-// ListTagsForResource attempts to implement the list tags api call
-func (m *MockCWClient) ListTagsForResource(r *cloudwatch.ListTagsForResourceInput) (*cloudwatch.ListTagsForResourceOutput, error) {
-	if response, ok := _listTagsForResourceResponses[*r.ResourceARN]; ok {
-		return response, nil
+// ListTagsForResource implements the list tags api call.
+func (m *MockCWAPI) ListTagsForResource(ctx context.Context, r *cloudwatch.ListTagsForResourceInput, optFns ...func(*cloudwatch.Options)) (*cloudwatch.ListTagsForResourceOutput, error) {
+	tags, ok := TagsByARN[aws.ToString(r.ResourceARN)]
+	if !ok {
+		return nil, &cwtypes.ResourceNotFoundException{
+			Message: aws.String(fmt.Sprintf("resource %s not found", aws.ToString(r.ResourceARN))),
+		}
 	}
-
-	return nil, awserr.New(cloudwatch.ErrCodeResourceNotFoundException, fmt.Sprintf("resource %+v not found", r), nil)
-}
-
-// GetMetricData implements the same fn in cloudwatch
-func (m *MockCWClient) GetMetricData(r *cloudwatch.GetMetricDataInput) (*cloudwatch.GetMetricDataOutput, error) {
-	// FIXME: only works with single queries
-	// note: something aws doesn't advertise - ValidationError: The value 62ba7bc1-7c4c-3747-4ab5-3a3dc4e40530 for parameter MetricDataQueries.member.1.Id is not matching the expected pattern ^[a-z][a-zA-Z0-9_]*$.
-	mID := *r.MetricDataQueries[0].Id
-	re := regexp.MustCompile(`^[a-z][a-zA-Z0-9_]*$`)
-	if !re.MatchString(mID) {
-		return nil, fmt.Errorf("%s: The value %s for parameter MetricDataQueries.member.1.Id is not matching the expected pattern ^[a-z][a-zA-Z0-9_]*$", "ValidationError", mID)
+	out := &cloudwatch.ListTagsForResourceOutput{}
+	for k, v := range tags {
+		out.Tags = append(out.Tags, cwtypes.Tag{Key: aws.String(k), Value: aws.String(v)})
 	}
-	if response, ok := GetMetricDataResponses[*r.MetricDataQueries[0].Id]; ok {
-		return response, nil
-	}
-
-	return nil, awserr.New(cloudwatch.ErrCodeResourceNotFoundException, fmt.Sprintf("resource %+v not found", r), nil)
+	return out, nil
 }
 
-/* not used for now
-func (m *MockCWClient) DescribeAlarms(input *cloudwatch.DescribeAlarmsInput) (*cloudwatch.DescribeAlarmsOutput, error) {
-	log.Infof("mock client describe alarms")
-	return nil, nil
+// GetMetricWidgetImage implements the metric widget rendering api call.
+func (m *MockCWAPI) GetMetricWidgetImage(ctx context.Context, r *cloudwatch.GetMetricWidgetImageInput, optFns ...func(*cloudwatch.Options)) (*cloudwatch.GetMetricWidgetImageOutput, error) {
+	m.LastWidgetJSON = aws.ToString(r.MetricWidget)
+	return &cloudwatch.GetMetricWidgetImageOutput{MetricWidgetImage: TestPNG}, nil
 }
-*/
 
+// GenTestSQSEvent returns a test SQS event with a correct body md5.
 func GenTestSQSEvent() awsevents.SQSEvent {
 	evt := testSQSEvent
 	for idx := range evt.Records {
@@ -408,5 +262,4 @@ func GenTestSQSEvent() awsevents.SQSEvent {
 		evt.Records[idx].Md5OfBody = fmt.Sprintf("%x", h.Sum(nil))
 	}
 	return evt
-
 }

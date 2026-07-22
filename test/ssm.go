@@ -14,79 +14,40 @@
 
 package test
 
-// Package test provides utilities and setup data for all tests
-
 import (
+	"context"
 	"fmt"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/service/ssm"
-	"github.com/aws/aws-sdk-go/service/ssm/ssmiface"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
+	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 )
 
 const (
 	// SlackTokenSSMKey is a test SSM parameter store key
 	SlackTokenSSMKey = "/service/cw_alert_router/slack/app/oauth/auth_token"
+	// SlackTokenValue is the token stored under SlackTokenSSMKey
+	SlackTokenValue = "abc123"
 )
 
-var (
-	// TestGetParametersByPathResponse defines some test responses for get parameters by path
-	TestSSMGetParametersByPathResponse = map[string]*ssm.GetParametersByPathOutput{
-		"/service/cw_alert_router/pagerduty/routing_keys/shared_key": {
-			Parameters: []*ssm.Parameter{
-				{
-					Value: aws.String("shared-key-test-string"),
-				},
-			},
-		},
-		"/service/cw_alert_router/pagerduty/routing_keys/test_service": {
-			Parameters: []*ssm.Parameter{
-				{
-					Value: aws.String("pagerduty-key-1"),
-				},
-			},
-		},
-	}
-
-	// TestGetParameterResponse defines some test reponses for get parameter
-	TestSSMGetParameterResponse = map[string]*ssm.GetParameterOutput{
-		"/service/cw_alert_router/pagerduty/routing_keys/test_service": {
-			Parameter: &ssm.Parameter{
-				Value: aws.String("pagerduty-key-1"),
-			},
-		},
-		"/service/cw_alert_router/pagerduty/routing_keys/shared_key": {
-			Parameter: &ssm.Parameter{
-				Value: aws.String("shared-key-test-string"),
-			},
-		},
-		SlackTokenSSMKey: {
-			Parameter: &ssm.Parameter{
-				Value: aws.String("abc123"),
-			},
-		},
-	}
-)
-
-// MockSSMClient is a mock SSM client for testing
-type MockSSMClient struct {
-	ssmiface.SSMAPI
+// TestSSMParameters defines the parameters the mock Systems Manager client serves.
+var TestSSMParameters = map[string]string{
+	"/service/cw_alert_router/pagerduty/routing_keys/test_service": "pagerduty-key-1",
+	"/service/cw_alert_router/pagerduty/routing_keys/shared_key":   "shared-key-test-string",
+	SlackTokenSSMKey: SlackTokenValue,
 }
 
-// GetParametersByPath implements the said function for the ssm client
-func (m *MockSSMClient) GetParametersByPath(req *ssm.GetParametersByPathInput) (*ssm.GetParametersByPathOutput, error) {
-	if response, ok := TestSSMGetParametersByPathResponse[*req.Path]; ok {
-		return response, nil
-	}
-	return nil, awserr.New(ssm.ErrCodeInvalidKeyId, fmt.Sprintf("resources %+v not found", req), nil)
-}
+// MockSSMClient is a mock Systems Manager client for testing.
+type MockSSMClient struct{}
 
-// GetParameter implements the same function from ssm
-func (m *MockSSMClient) GetParameter(req *ssm.GetParameterInput) (*ssm.GetParameterOutput, error) {
-	if response, ok := TestSSMGetParameterResponse[*req.Name]; ok {
-		return response, nil
+// GetParameter implements the same function from ssm.
+func (m *MockSSMClient) GetParameter(ctx context.Context, req *ssm.GetParameterInput, optFns ...func(*ssm.Options)) (*ssm.GetParameterOutput, error) {
+	if value, ok := TestSSMParameters[aws.ToString(req.Name)]; ok {
+		return &ssm.GetParameterOutput{
+			Parameter: &ssmtypes.Parameter{Value: aws.String(value)},
+		}, nil
 	}
-
-	return nil, awserr.New(ssm.ErrCodeInvalidKeyId, fmt.Sprintf("resources %+v not found", req), nil)
+	return nil, &ssmtypes.ParameterNotFound{
+		Message: aws.String(fmt.Sprintf("parameter %s not found", aws.ToString(req.Name))),
+	}
 }

@@ -1,24 +1,34 @@
 version: '3'
 
 tasks:
-  base:
-    cmds:
-      - docker build --target base . -t cw-alert-router:base
   test:
-    deps: [base]
+    desc: Run unit and integration tests
     cmds:
-      - docker run -t cw-alert-router:base go test -v ./...
+      - go test -v ./...
+
   build:
+    desc: Build the lambda deployment package (function.zip) via docker
     cmds:
       - docker build --target build -t cw-alert-router:build .
+
   publish:
+    desc: Copy function.zip out of the build image into the working directory
     deps: [build]
     cmds:
-      - docker run -v "$(PWD):/target" --rm cw-alert-router:build cp /app/function.zip /target
-  cov:
+      - docker run -v "{{.PWD}}:/target" --rm cw-alert-router:build cp /app/function.zip /target
+
+  build-local:
+    desc: Build the lambda bootstrap binary + function.zip without docker
     cmds:
-      - go test -v -cverprofile=coverage.out -covermode=atomic -coverpkg=./... ./...
+      - CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -tags lambda.norpc -o bootstrap .
+      - zip function.zip bootstrap
+
+  cov:
+    desc: Run tests with coverage
+    cmds:
+      - go test -v -coverprofile=coverage.out -covermode=atomic -coverpkg=./... ./...
+
   clean:
     cmds:
+      - rm -f bootstrap function.zip coverage.out
       - docker rmi -f cw-alert-router:build
-

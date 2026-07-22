@@ -1,4 +1,4 @@
-// Copyright 2022 Aspiro AB Music AS
+// Copyright 2022 Aspiro AB
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,31 +15,22 @@
 package parameterstore_test
 
 import (
+	"context"
 	"testing"
 
-	"github.com/tidal-open-source/cw-alert-router/parameterstore"
-	"github.com/tidal-open-source/cw-alert-router/test"
+	"github.com/tidal-music/cw-alert-router/v2/parameterstore"
+	"github.com/tidal-music/cw-alert-router/v2/test"
 )
 
 var (
-	psclient                    *parameterstore.Client
 	validParameterStoreKey      = "/service/cw_alert_router/pagerduty/routing_keys/shared_key"
 	expectedParameterStoreValue = "shared-key-test-string"
 	invalidParameterStoreKey    = "/service/nonexists/something"
 )
 
-func setup(t *testing.T) {
-	var err error
-	mc := &test.MockSSMClient{}
-	psclient, err = parameterstore.NewWithSSMClient(mc)
-	if err != nil {
-		t.Fatalf("Failed initializing mock client: %v", err)
-	}
-}
-
 func TestGetValidResponse(t *testing.T) {
-	setup(t)
-	value, err := psclient.GetParameterValue(validParameterStoreKey)
+	psclient := parameterstore.NewWithAPI(&test.MockSSMClient{})
+	value, err := psclient.GetParameterValue(context.Background(), validParameterStoreKey)
 	if err != nil {
 		t.Errorf("Error fetching key %s: %v", validParameterStoreKey, err)
 	}
@@ -49,9 +40,12 @@ func TestGetValidResponse(t *testing.T) {
 }
 
 func TestGetInvalidKey(t *testing.T) {
-	setup(t)
-	_, err := psclient.GetParameterValue(invalidParameterStoreKey)
+	psclient := parameterstore.NewWithAPI(&test.MockSSMClient{})
+	_, err := psclient.GetParameterValue(context.Background(), invalidParameterStoreKey)
 	if err == nil {
-		t.Errorf("Expected error when fetching key %s, but no error was returned.", invalidParameterStoreKey)
+		t.Fatalf("Expected error when fetching key %s, but no error was returned.", invalidParameterStoreKey)
+	}
+	if !parameterstore.IsNotFound(err) {
+		t.Errorf("expected IsNotFound to be true for error: %v", err)
 	}
 }

@@ -15,56 +15,67 @@
 package pagerduty_test
 
 import (
+	"context"
 	"testing"
 
-	"github.com/tidal-open-source/cw-alert-router/pagerduty"
-	"github.com/tidal-open-source/cw-alert-router/test"
+	"github.com/tidal-music/cw-alert-router/v2/pagerduty"
+	"github.com/tidal-music/cw-alert-router/v2/test"
 )
 
-var (
-	pdclient pagerduty.PDAPIClientInterface
-	client   *pagerduty.Client
-)
-
-func setup(t *testing.T) {
-	var err error
-	pdclient = &test.MockPDClient{}
-	client, err = pagerduty.New(pagerduty.WithPDAPIClient(pdclient))
+func TestSubmitEvent(t *testing.T) {
+	mock := &test.MockPDClient{}
+	client, err := pagerduty.New(pagerduty.WithAPI(mock))
 	if err != nil {
 		t.Fatalf("Failed creating pagerduty client: %v", err)
 	}
-}
 
-func TestPDCallOKAlarm(t *testing.T) {
-	setup(t)
-	err := client.SubmitEvent("abc123", &test.ExpectedAlarmDetails)
-	if err != nil {
+	evt := test.TriggeredAlarmDetails
+	if err := client.SubmitEvent(context.Background(), "abc123", pagerduty.ActionTrigger, &evt); err != nil {
 		t.Errorf("Failed sending event to pagerduty: %v", err)
 	}
-}
 
-func TestPDEventAction(t *testing.T) {
-	setup(t)
-	e := &test.TriggeredAlarmDetails
-	pdAction := client.EventAction(e)
-	expectedAction := "trigger"
-	if pdAction != expectedAction {
-		t.Errorf("action %s didn't match expected: %s", pdAction, expectedAction)
+	events := mock.Events()
+	if len(events) != 1 {
+		t.Fatalf("expected 1 pagerduty event, got %d", len(events))
 	}
-	e = &test.InsufficientDataToOKAlarmDetails
-	pdAction = client.EventAction(e)
-	expectedAction = ""
-	if pdAction != expectedAction {
-		t.Errorf("action %s didn't match expected: %s", pdAction, expectedAction)
+	if events[0].Action != pagerduty.ActionTrigger {
+		t.Errorf("expected trigger action, got %s", events[0].Action)
+	}
+	if events[0].DedupKey != "arn:aws:cloudwatch:us-east-1:1234567890123:alarm:test-service-alarm-abcd" {
+		t.Errorf("unexpected dedup key: %s", events[0].DedupKey)
 	}
 }
 
-func TestSuppressPagerDuty(t *testing.T) {
-	setup(t)
-	e := &test.SuppressPagerDutyTrue
-	pdAction := client.EventAction(e)
-	expectedAction := ""
-	if pdAction != expectedAction {
-		t.Errorf("action #{pdAction} didn't match expected: #{expectedAction}")
+func TestSubmitEventNoneAction(t *testing.T) {
+	mock := &test.MockPDClient{}
+	client, err := pagerduty.New(pagerduty.WithAPI(mock))
+	if err != nil {
+		t.Fatalf("Failed creating pagerduty client: %v", err)
+	}
+
+	evt := test.ExpectedAlarmDetails
+	if err := client.SubmitEvent(context.Background(), "abc123", pagerduty.ActionNone, &evt); err != nil {
+		t.Errorf("SubmitEvent with ActionNone should be a no-op, got error: %v", err)
+	}
+	if len(mock.Events()) != 0 {
+		t.Errorf("expected no pagerduty events, got %d", len(mock.Events()))
+	}
+}
+
+func TestAction(t *testing.T) {
+	tests := []struct {
+		previous, current, expected string
+	}{
+		{"OK", "ALARM", pagerduty.ActionTrigger},
+		{"INSUFFICIENT_DATA", "ALARM", pagerduty.ActionTrigger},
+		{"ALARM", "OK", pagerduty.ActionResolve},
+		{"INSUFFICIENT_DATA", "OK", pagerduty.ActionNone},
+		{"OK", "INSUFFICIENT_DATA", pagerduty.ActionNone},
+		{"ALARM", "INSUFFICIENT_DATA", pagerduty.ActionNone},
+	}
+	for _, tc := range tests {
+		if got := pagerduty.Action(tc.previous, tc.current); got != tc.expected {
+			t.Errorf("Action(%s -> %s) = %q, expected %q", tc.previous, tc.current, got, tc.expected)
+		}
 	}
 }

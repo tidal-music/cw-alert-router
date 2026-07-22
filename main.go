@@ -15,17 +15,18 @@
 package main
 
 import (
-	log "github.com/sirupsen/logrus"
-	"github.com/tidal-open-source/cw-alert-router/lambda"
+	"context"
+	"log/slog"
+	"os"
+
+	"github.com/tidal-music/cw-alert-router/v2/lambda"
 )
 
 func main() {
-	cfg, err := lambda.NewConfig()
-
+	h, err := lambda.New(context.Background(), lambda.ConfigFromEnv())
 	if err != nil {
-		log.Fatalf("Error initializing lambda: %v", err)
+		slog.Error("failed initializing lambda", "error", err)
+		os.Exit(1)
 	}
-
-	lambda.SetConfig(cfg)
-	lambda.Start()
+	h.Start()
 }

@@ -14,21 +14,34 @@
 
 package test
 
-// Package test provides utilities and setup data for all tests
-
 import (
+	"context"
+	"sync"
+
 	pdapi "github.com/PagerDuty/go-pagerduty"
 )
 
-// MockPDClient is a mock PagerDuty (our own) client
-type MockPDClient struct{}
+// MockPDClient is a mock PagerDuty API client that records submitted events.
+type MockPDClient struct {
+	mu     sync.Mutex
+	events []*pdapi.V2Event
+}
 
-// ManageEvent - implement the same event from the pagerduty library
-func (p *MockPDClient) ManageEvent(e pdapi.V2Event) (*pdapi.V2EventResponse, error) {
-	resp := &pdapi.V2EventResponse{
+// ManageEventWithContext implements the pagerduty events API call.
+func (p *MockPDClient) ManageEventWithContext(ctx context.Context, e *pdapi.V2Event) (*pdapi.V2EventResponse, error) {
+	p.mu.Lock()
+	p.events = append(p.events, e)
+	p.mu.Unlock()
+	return &pdapi.V2EventResponse{
 		Status:   "success",
 		Message:  "Event processed.",
 		DedupKey: e.DedupKey,
-	}
-	return resp, nil
+	}, nil
+}
+
+// Events returns the events submitted so far.
+func (p *MockPDClient) Events() []*pdapi.V2Event {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]*pdapi.V2Event(nil), p.events...)
 }

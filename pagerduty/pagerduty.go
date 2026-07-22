@@ -16,132 +16,108 @@
 package pagerduty
 
 import (
+	"context"
+	"fmt"
+	"log/slog"
+
 	pdapi "github.com/PagerDuty/go-pagerduty"
-	log "github.com/sirupsen/logrus"
-	"github.com/tidal-open-source/cw-alert-router/cw"
+	"github.com/tidal-music/cw-alert-router/v2/cw"
 )
 
 const (
 	defaultEventSeverity = "critical"
-	clientName           = "cw-notify"
+	clientName           = "cw-alert-router"
 )
 
-// PDAPIClientInterface is an interface for the purpose of overriding the pagerduty client behaviour
-type PDAPIClientInterface interface {
-	ManageEvent(pdapi.V2Event) (*pdapi.V2EventResponse, error)
+// Actions we submit to the PagerDuty events API.
+const (
+	ActionTrigger = "trigger"
+	ActionResolve = "resolve"
+	ActionNone    = ""
+)
+
+// API is the subset of the PagerDuty client this service uses.
+type API interface {
+	ManageEventWithContext(ctx context.Context, e *pdapi.V2Event) (*pdapi.V2EventResponse, error)
 }
 
-type defaultPDAPIClient struct {
-}
-
-func (c *defaultPDAPIClient) ManageEvent(e pdapi.V2Event) (*pdapi.V2EventResponse, error) {
-	return pdapi.ManageEvent(e)
-}
-
-// Client is a wrapper for the pagerduty client
+// Client is a wrapper for the pagerduty client.
 type Client struct {
-	pd PDAPIClientInterface
+	api API
 }
 
-// ClientOptions provides the method to configure the new client
+// ClientOptions provides the method to configure the new client.
 type ClientOptions func(*Client)
 
-// WithPDAPIClient allows overriding the pdapi client
-func WithPDAPIClient(pd PDAPIClientInterface) ClientOptions {
+// WithAPI allows overriding the pagerduty API client (for testing).
+func WithAPI(api API) ClientOptions {
 	return func(c *Client) {
-		c.pd = pd
+		c.api = api
 	}
 }
 
-// New returns a new Client
+// New returns a new Client.
 func New(opts ...ClientOptions) (*Client, error) {
 	c := &Client{}
-
 	for _, opt := range opts {
 		opt(c)
 	}
-
-	if c.pd == nil {
-		c.pd = &defaultPDAPIClient{}
+	if c.api == nil {
+		// the events API authenticates via routing key, not account token
+		c.api = pdapi.NewClient("")
 	}
-
 	return c, nil
 }
 
-// EventAction returns the pagerduty action we'll take based on the Cloudwatch alarm
-func (c *Client) EventAction(detail *cw.EventDetails) string {
-	previousState := detail.Detail.PreviousState.Value
-	currentState := detail.Detail.State.Value
-	suppressPagerduty := detail.Detail.Tags["alerts:suppress_pagerduty"]
-
-	// Do not send event if alerts:suppress_pagerduty tag is set to "true"
-	if suppressPagerduty == "true" {
-		return ""
-	}
-
+// Action returns the PagerDuty event action for an alarm state transition:
+// ActionTrigger, ActionResolve or ActionNone.
+func Action(previousState, currentState string) string {
 	switch currentState {
-	case "OK":
-		if previousState == "ALARM" {
-			return "resolve"
+	case cw.StateAlarm:
+		return ActionTrigger
+	case cw.StateOK:
+		if previousState == cw.StateAlarm {
+			return ActionResolve
 		}
-		return ""
-	case "ALARM":
-		return "trigger"
+		return ActionNone
 	default:
-		return ""
+		return ActionNone
 	}
 }
 
-// SubmitEvent sends an event to PagerDuty using alarm details from cloudwatch
-// - note: some logic here - it will change the PagerDuty action based on the current cw alarm status
-func (c *Client) SubmitEvent(routingKey string, detail *cw.EventDetails) error {
-	log.Printf("SubmitEvent(routingKey(%s), %+v)", maskKey(routingKey), detail)
+// SubmitEvent sends an event with the given action to PagerDuty using alarm
+// details from the CloudWatch event.
+func (c *Client) SubmitEvent(ctx context.Context, routingKey string, action string, evt *cw.Event) error {
+	if action == ActionNone {
+		return nil
+	}
 
-	alarmARN, err := detail.AlarmARN()
+	alarmARN, err := evt.AlarmARN()
 	if err != nil {
 		return err
 	}
 
-	severity := defaultEventSeverity
-	timestamp := detail.Detail.State.Timestamp
-	suppressalert := detail.Detail.Tags["alerts:suppress_pagerduty"]
+	slog.Info("submitting pagerduty event",
+		"routing_key", maskKey(routingKey), "action", action, "alarm", evt.Detail.AlarmName)
 
-	payload := &pdapi.V2Payload{
-		Summary:   detail.Detail.AlarmName,
-		Source:    alarmARN,
-		Severity:  severity,
-		Timestamp: timestamp,
-		Details:   detail,
-	}
-
-	action := c.EventAction(detail)
-	log.Infof("Pagerduty action: %s", action)
-
-	if action == "" {
-		log.Warnf("PagerDuty action was empty.  Not sending anything.")
-		return nil
-	}
-
-	if suppressalert == "true" {
-		log.Warnf("'suppress_pagerduty' tag is set to 'true'. Not sending event to PagerDuty.")
-		return nil
-	}
-
-	ev := pdapi.V2Event{
+	resp, err := c.api.ManageEventWithContext(ctx, &pdapi.V2Event{
 		RoutingKey: routingKey,
 		Action:     action,
 		DedupKey:   alarmARN,
 		Client:     clientName,
-		Payload:    payload,
+		Payload: &pdapi.V2Payload{
+			Summary:   evt.Detail.AlarmName,
+			Source:    alarmARN,
+			Severity:  defaultEventSeverity,
+			Timestamp: evt.Detail.State.Timestamp,
+			Details:   evt,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("submitting pagerduty event for %s: %w", evt.Detail.AlarmName, err)
 	}
-	// So - PagerDuty have updated their go library to use the Client struct for many api calls...
-	// ie: ManageEvent is just a function exported from the pagerduty package.  It does _not_ use
-	// the initalized client - hence, we cannot override its settings (eg: for testing).
-	// So we cannot test this very well unfortunately...
-	// TODO: actually, this was merged: https://github.com/PagerDuty/go-pagerduty/pull/241
-	status, err := c.pd.ManageEvent(ev)
-	log.Infof("pagerduty response: %+v", status)
-	return err
+	slog.Debug("pagerduty response", "status", resp.Status, "message", resp.Message)
+	return nil
 }
 
 func maskKey(s string) string {
