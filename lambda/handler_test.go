@@ -19,6 +19,8 @@ import (
 	"strings"
 	"testing"
 
+	awsevents "github.com/aws/aws-lambda-go/events"
+
 	"github.com/tidal-music/cw-alert-router/v2/cw"
 	"github.com/tidal-music/cw-alert-router/v2/lambda"
 	"github.com/tidal-music/cw-alert-router/v2/pagerduty"
@@ -291,5 +293,35 @@ func TestHandleRequestBatchFailures(t *testing.T) {
 	}
 	if resp.BatchItemFailures[0].ItemIdentifier != sqsEvent.Records[0].MessageId {
 		t.Errorf("unexpected failed item identifier: %s", resp.BatchItemFailures[0].ItemIdentifier)
+	}
+}
+
+func TestHandleRequestStopsOnFirstFailure(t *testing.T) {
+	f := newFixture(t, baseConfig())
+
+	// a failing record followed by a valid one: the valid record must not be
+	// processed (FIFO ordering) and both must be reported as failures
+	sqsEvent := test.GenTestSQSEvent()
+	good := sqsEvent.Records[0]
+	bad := good
+	bad.MessageId = "bad-record"
+	bad.Body = "this is not json{"
+	sqsEvent.Records = []awsevents.SQSMessage{bad, good}
+
+	resp, err := f.handler.HandleRequest(context.Background(), sqsEvent)
+	if err != nil {
+		t.Fatalf("HandleRequest returned error: %v", err)
+	}
+	if len(resp.BatchItemFailures) != 2 {
+		t.Fatalf("expected 2 batch item failures, got %+v", resp.BatchItemFailures)
+	}
+	if resp.BatchItemFailures[0].ItemIdentifier != "bad-record" {
+		t.Errorf("first failure should be the bad record, got %s", resp.BatchItemFailures[0].ItemIdentifier)
+	}
+	if resp.BatchItemFailures[1].ItemIdentifier != good.MessageId {
+		t.Errorf("second failure should be the unprocessed record, got %s", resp.BatchItemFailures[1].ItemIdentifier)
+	}
+	if got := len(f.slack.Messages()); got != 0 {
+		t.Errorf("no records should have been processed after the failure, got %d slack messages", got)
 	}
 }

@@ -341,32 +341,40 @@ func (h *Handler) ProcessEvent(ctx context.Context, evt *cw.Event) error {
 	return h.pd.SubmitEvent(ctx, routingKey, action, evt)
 }
 
-// HandleRequest is the main entrypoint for the lambda. It processes each SQS
-// record independently and reports failures per-record, so a bad message
-// doesn't force redelivery (and re-alerting) of the whole batch. The SQS
-// event source mapping must enable ReportBatchItemFailures.
+// HandleRequest is the main entrypoint for the lambda. Records are processed
+// in order; on the first failure the failed record and every remaining record
+// are reported as batch item failures, so only successfully processed records
+// are deleted from the queue. Stopping at the first failure preserves FIFO
+// queue ordering: successors are never handled before a failed record's
+// redelivery. The SQS event source mapping must enable
+// ReportBatchItemFailures.
 func (h *Handler) HandleRequest(ctx context.Context, sqsEvent awsevents.SQSEvent) (awsevents.SQSEventResponse, error) {
 	var resp awsevents.SQSEventResponse
 
-	for _, msg := range sqsEvent.Records {
+	for i, msg := range sqsEvent.Records {
 		slog.Info("processing sqs message", "message_id", msg.MessageId, "source", msg.EventSource)
 		slog.Debug("sqs message body", "body", msg.Body)
 
-		evt := &cw.Event{}
-		if err := json.Unmarshal([]byte(msg.Body), evt); err != nil {
-			slog.Error("failed decoding sqs message body", "message_id", msg.MessageId, "error", err)
-			resp.BatchItemFailures = append(resp.BatchItemFailures,
-				awsevents.SQSBatchItemFailure{ItemIdentifier: msg.MessageId})
-			continue
-		}
-		if err := h.ProcessEvent(ctx, evt); err != nil {
-			slog.Error("failed processing event", "message_id", msg.MessageId, "error", err)
-			resp.BatchItemFailures = append(resp.BatchItemFailures,
-				awsevents.SQSBatchItemFailure{ItemIdentifier: msg.MessageId})
+		if err := h.processRecord(ctx, msg); err != nil {
+			slog.Error("failed processing sqs message", "message_id", msg.MessageId, "error", err)
+			for _, unprocessed := range sqsEvent.Records[i:] {
+				resp.BatchItemFailures = append(resp.BatchItemFailures,
+					awsevents.SQSBatchItemFailure{ItemIdentifier: unprocessed.MessageId})
+			}
+			break
 		}
 	}
 
 	return resp, nil
+}
+
+// processRecord decodes and processes a single SQS record.
+func (h *Handler) processRecord(ctx context.Context, msg awsevents.SQSMessage) error {
+	evt := &cw.Event{}
+	if err := json.Unmarshal([]byte(msg.Body), evt); err != nil {
+		return fmt.Errorf("decoding sqs message body: %w", err)
+	}
+	return h.ProcessEvent(ctx, evt)
 }
 
 // Start begins the lambda handler.
