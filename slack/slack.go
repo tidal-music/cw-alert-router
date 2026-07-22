@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	slackapi "github.com/slack-go/slack"
 
@@ -31,6 +32,12 @@ import (
 const (
 	triggeredPrefix = ":rotating_light: (triggered)"
 	resolvedPrefix  = ":white_check_mark: (resolved)"
+)
+
+// Retry budget for referencing a just-uploaded file from an image block.
+const (
+	uploadedFileAttempts   = 3
+	uploadedFileRetryDelay = 500 * time.Millisecond
 )
 
 // ImageRef points at a graph image to embed in a message: either a public
@@ -174,12 +181,46 @@ func (c *Client) SendEventTriggered(ctx context.Context, channel string, evt *cw
 }
 
 func (c *Client) sendEvent(ctx context.Context, channel string, evt *cw.Event, img ImageRef, prefix string) (string, string, error) {
-	blocks := []slackapi.Block{c.HeaderBlock(evt, prefix), c.SummaryBlock(evt)}
-	if imgBlock := c.imageBlock(img); imgBlock != nil {
-		blocks = append(blocks, imgBlock)
+	buildBlocks := func(withImage bool) []slackapi.Block {
+		blocks := []slackapi.Block{c.HeaderBlock(evt, prefix), c.SummaryBlock(evt)}
+		if withImage {
+			if imgBlock := c.imageBlock(img); imgBlock != nil {
+				blocks = append(blocks, imgBlock)
+			}
+		}
+		blocks = append(blocks, c.LinkBlock(evt))
+		return blocks
 	}
-	blocks = append(blocks, c.LinkBlock(evt))
-	return c.SendMessage(ctx, channel, slackapi.MsgOptionBlocks(blocks...))
+
+	// A freshly uploaded slack file can take a moment before it is
+	// referenceable from an image block; retry briefly, then fall back to
+	// sending without the graph - the alert matters more than the image.
+	var lastErr error
+	for attempt := 0; attempt < uploadedFileAttempts; attempt++ {
+		id, ts, err := c.SendMessage(ctx, channel, slackapi.MsgOptionBlocks(buildBlocks(true)...))
+		if err == nil {
+			return id, ts, nil
+		}
+		lastErr = err
+		if img.SlackFileID == "" || !isTransientFileError(err) {
+			return "", "", err
+		}
+		slog.Warn("uploaded slack file not referenceable yet, retrying", "attempt", attempt+1, "error", err)
+		select {
+		case <-ctx.Done():
+			return "", "", ctx.Err()
+		case <-time.After(uploadedFileRetryDelay):
+		}
+	}
+	slog.Error("giving up embedding the uploaded graph, sending without it", "error", lastErr)
+	return c.SendMessage(ctx, channel, slackapi.MsgOptionBlocks(buildBlocks(false)...))
+}
+
+// isTransientFileError reports whether a postMessage failure looks like the
+// uploaded file simply isn't ready to be referenced yet.
+func isTransientFileError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "invalid_blocks") || strings.Contains(msg, "file_not_found")
 }
 
 // SendMessage sends a message to a slack channel and returns the channel ID and timestamp.

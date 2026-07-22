@@ -18,6 +18,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -181,6 +184,75 @@ func TestUploadImage(t *testing.T) {
 	}
 	if !bytes.Equal(uploaded, test.TestPNG) {
 		t.Errorf("uploaded content didn't match the source PNG")
+	}
+}
+
+func TestSendEventRetriesUnreadySlackFile(t *testing.T) {
+	// the first two postMessage calls claim the file block is invalid (the
+	// upload isn't ready yet), the third succeeds
+	var calls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/chat.postMessage", func(rw http.ResponseWriter, r *http.Request) {
+		calls++
+		rw.Header().Set("Content-Type", "application/json")
+		if calls < 3 {
+			rw.Write([]byte(`{"ok":false,"error":"invalid_blocks"}`))
+			return
+		}
+		rw.Write([]byte(`{"ok":true,"channel":"C123","ts":"1.2"}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	sc, err := slack.New("blah", slack.WithAlternativeURL(server.URL+"/"))
+	if err != nil {
+		t.Fatalf("failed initializing slack client: %v", err)
+	}
+
+	_, _, err = sc.SendEventTriggered(context.Background(), "test-channel",
+		&test.TriggeredAlarmDetails, slack.ImageRef{SlackFileID: "F0000001"})
+	if err != nil {
+		t.Fatalf("expected retry to succeed, got error: %v", err)
+	}
+	if calls != 3 {
+		t.Errorf("expected 3 postMessage attempts, got %d", calls)
+	}
+}
+
+func TestSendEventFallsBackWithoutImage(t *testing.T) {
+	// postMessage keeps rejecting the file block; the final attempt must
+	// drop the image and still deliver the alert
+	var bodies []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/chat.postMessage", func(rw http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(body))
+		rw.Header().Set("Content-Type", "application/json")
+		if strings.Contains(string(body), "slack_file") {
+			rw.Write([]byte(`{"ok":false,"error":"invalid_blocks"}`))
+			return
+		}
+		rw.Write([]byte(`{"ok":true,"channel":"C123","ts":"1.2"}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	sc, err := slack.New("blah", slack.WithAlternativeURL(server.URL+"/"))
+	if err != nil {
+		t.Fatalf("failed initializing slack client: %v", err)
+	}
+
+	_, _, err = sc.SendEventTriggered(context.Background(), "test-channel",
+		&test.TriggeredAlarmDetails, slack.ImageRef{SlackFileID: "F0000001"})
+	if err != nil {
+		t.Fatalf("expected fallback without image to succeed, got error: %v", err)
+	}
+	last := bodies[len(bodies)-1]
+	if strings.Contains(last, "slack_file") {
+		t.Errorf("final message should have dropped the image block: %s", last)
+	}
+	if !strings.Contains(last, "triggered") {
+		t.Errorf("final message should still be the alert: %s", last)
 	}
 }
 
