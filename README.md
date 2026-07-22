@@ -112,9 +112,11 @@ task build-local
 Deploy `function.zip` on the `provided.al2023` runtime (arm64), wire an
 EventBridge rule for `CloudWatch Alarm State Change` events into an SQS
 queue consumed by the Lambda, and set the environment variables above. The
-SQS event source mapping should enable `ReportBatchItemFailures` - the
-handler reports failures per message so one bad event doesn't re-deliver
-(and re-alert) the whole batch.
+SQS event source mapping should enable `ReportBatchItemFailures` - records
+are processed in order and successfully processed records aren't re-delivered
+(and re-alerted) when a later record in the batch fails. On a failure the
+handler stops and reports the failed record plus the rest of the batch, so
+FIFO queue ordering is preserved on redelivery.
 
 The Lambda role needs: `cloudwatch:ListTagsForResource`,
 `cloudwatch:GetMetricWidgetImage`, `ssm:GetParameter` on the keys above, and
