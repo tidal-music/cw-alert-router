@@ -35,8 +35,10 @@ key (from the environment) are used. Only `OK -> ALARM` (trigger) and
 
 Graphs are rendered server-side by CloudWatch
 ([`GetMetricWidgetImage`](https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_GetMetricWidgetImage.html))
-with the alarm's own threshold annotation - metric math and multi-metric
-alarms work out of the box. Delivery is controlled by `GRAPH_MODE`:
+from the metric queries in the alarm event, with the alarm's threshold drawn
+as a horizontal annotation - metric math and multi-metric alarms work out of
+the box. (Composite alarms carry no metrics, so they get no graph.) Delivery
+is controlled by `GRAPH_MODE`:
 
 | Mode | Behaviour |
 |:--|:--|

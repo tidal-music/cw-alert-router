@@ -18,6 +18,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"regexp"
+	"slices"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -70,33 +73,94 @@ func (c *Client) AlarmTags(ctx context.Context, alarmARN string) (map[string]str
 }
 
 // widget is the metric-widget definition passed to GetMetricWidgetImage.
-// Annotating with the alarm ARN makes CloudWatch render the alarm's own
-// metrics (including metric math) with its threshold line.
+// It is built from the metric queries in the alarm event payload:
+// GetMetricWidgetImage does not accept the dashboard-only alarm annotation
+// ("annotations": {"alarms": [...]}), so the alarm's threshold is drawn as a
+// horizontal annotation instead.
 type widget struct {
-	Width       int               `json:"width"`
-	Height      int               `json:"height"`
-	Start       string            `json:"start"`
-	End         string            `json:"end"`
-	Annotations widgetAnnotations `json:"annotations"`
+	Width       int                `json:"width"`
+	Height      int                `json:"height"`
+	Start       string             `json:"start"`
+	End         string             `json:"end"`
+	Metrics     [][]any            `json:"metrics"`
+	Annotations *widgetAnnotations `json:"annotations,omitempty"`
 }
 
 type widgetAnnotations struct {
-	Alarms []string `json:"alarms"`
+	Horizontal []widgetThreshold `json:"horizontal,omitempty"`
 }
 
-// AlarmWidgetImage renders a PNG graph of the alarm's metrics (with threshold
-// annotation) ending at the given time and spanning the given window.
-func (c *Client) AlarmWidgetImage(ctx context.Context, alarmARN string, end time.Time, window time.Duration) ([]byte, error) {
+type widgetThreshold struct {
+	Value float64 `json:"value"`
+	Label string  `json:"label"`
+}
+
+// widgetIDPattern is the metric id format GetMetricWidgetImage accepts.
+// CloudWatch auto-generates UUID ids for simple alarms; those are rejected
+// by the API (and nothing references them), so they are dropped.
+var widgetIDPattern = regexp.MustCompile(`^[a-z][a-zA-Z0-9_]*$`)
+
+// widgetMetrics converts the alarm's metric queries to the widget "metrics"
+// array syntax: one row per query, either a metric-math expression object or
+// [namespace, name, dimName, dimValue, ..., {options}]. Queries with
+// returnData=false (inputs to metric math) are included but hidden.
+func widgetMetrics(queries []MetricDataQuery) [][]any {
+	var rows [][]any
+	for _, q := range queries {
+		opts := map[string]any{}
+		if widgetIDPattern.MatchString(q.ID) {
+			opts["id"] = q.ID
+		}
+		if q.Label != "" {
+			opts["label"] = q.Label
+		}
+		if !q.ReturnData {
+			opts["visible"] = false
+		}
+		if q.Expression != "" {
+			opts["expression"] = q.Expression
+			rows = append(rows, []any{opts})
+			continue
+		}
+		if q.MetricStat == nil {
+			continue
+		}
+		opts["stat"] = q.MetricStat.Stat
+		opts["period"] = q.MetricStat.Period
+		m := q.MetricStat.Metric
+		row := []any{m.Namespace, m.Name}
+		for _, k := range slices.Sorted(maps.Keys(m.Dimensions)) {
+			row = append(row, k, m.Dimensions[k])
+		}
+		rows = append(rows, append(row, opts))
+	}
+	return rows
+}
+
+// AlarmWidgetImage renders a PNG graph of the alarm's metrics (with its
+// threshold as a horizontal annotation) ending at the given time and
+// spanning the given window.
+func (c *Client) AlarmWidgetImage(ctx context.Context, evt *Event, end time.Time, window time.Duration) ([]byte, error) {
+	metrics := widgetMetrics(evt.Detail.Configuration.Metrics)
+	if len(metrics) == 0 {
+		return nil, fmt.Errorf("alarm %s has no metrics to graph", evt.Detail.AlarmName)
+	}
 	if window <= 0 {
 		window = DefaultGraphWindow
 	}
-	def, err := json.Marshal(widget{
-		Width:       DefaultGraphWidth,
-		Height:      DefaultGraphHeight,
-		Start:       end.Add(-window).UTC().Format(time.RFC3339),
-		End:         end.UTC().Format(time.RFC3339),
-		Annotations: widgetAnnotations{Alarms: []string{alarmARN}},
-	})
+	w := widget{
+		Width:   DefaultGraphWidth,
+		Height:  DefaultGraphHeight,
+		Start:   end.Add(-window).UTC().Format(time.RFC3339),
+		End:     end.UTC().Format(time.RFC3339),
+		Metrics: metrics,
+	}
+	if threshold, ok := evt.Threshold(); ok {
+		w.Annotations = &widgetAnnotations{
+			Horizontal: []widgetThreshold{{Value: threshold, Label: "threshold"}},
+		}
+	}
+	def, err := json.Marshal(w)
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +168,7 @@ func (c *Client) AlarmWidgetImage(ctx context.Context, alarmARN string, end time
 		MetricWidget: aws.String(string(def)),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("rendering metric widget image for %s: %w", alarmARN, err)
+		return nil, fmt.Errorf("rendering metric widget image for %s: %w", evt.Detail.AlarmName, err)
 	}
 	return resp.MetricWidgetImage, nil
 }

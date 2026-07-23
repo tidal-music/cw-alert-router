@@ -17,6 +17,7 @@
 package cw
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"time"
@@ -112,6 +113,19 @@ func (e *Event) AlarmARN() (string, error) {
 func (e *Event) ConsoleLink() string {
 	return fmt.Sprintf("https://console.aws.amazon.com/cloudwatch/home?region=%s#alarmsV2:alarm/%s",
 		e.Region, url.PathEscape(e.Detail.AlarmName))
+}
+
+// Threshold returns the alarm threshold parsed from the state's reason data,
+// and whether one was present (composite and some anomaly-detection alarms
+// don't carry one).
+func (e *Event) Threshold() (float64, bool) {
+	var rd struct {
+		Threshold *float64 `json:"threshold"`
+	}
+	if err := json.Unmarshal([]byte(e.Detail.State.ReasonData), &rd); err != nil || rd.Threshold == nil {
+		return 0, false
+	}
+	return *rd.Threshold, true
 }
 
 // StateChangeTime returns the time the alarm changed state, falling back to
