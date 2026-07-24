@@ -238,12 +238,12 @@ func (h *Handler) PagerDutyRoutingKey(ctx context.Context, serviceName string) (
 // graphImage renders the alarm graph and returns a reference to embed in the
 // Slack message. Failures are logged, not returned - a missing graph should
 // never block an alert.
-func (h *Handler) graphImage(ctx context.Context, evt *cw.Event, alarmARN string) slack.ImageRef {
+func (h *Handler) graphImage(ctx context.Context, evt *cw.Event) slack.ImageRef {
 	if h.cfg.GraphMode == GraphModeNone {
 		return slack.ImageRef{}
 	}
 
-	png, err := h.cw.AlarmWidgetImage(ctx, alarmARN, evt.StateChangeTime(), cw.DefaultGraphWindow)
+	png, err := h.cw.AlarmWidgetImage(ctx, evt, evt.StateChangeTime(), cw.DefaultGraphWindow)
 	if err != nil {
 		slog.Error("failed rendering alarm graph", "alarm", evt.Detail.AlarmName, "error", err)
 		return slack.ImageRef{}
@@ -310,7 +310,7 @@ func (h *Handler) ProcessEvent(ctx context.Context, evt *cw.Event) error {
 	}
 
 	channel := h.SlackChannel(tags)
-	img := h.graphImage(ctx, evt, alarmARN)
+	img := h.graphImage(ctx, evt)
 
 	var channelID, ts string
 	var slackErr error
